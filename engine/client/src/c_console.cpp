@@ -1,0 +1,2491 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 9fb2bd1df7f53b2d8098968ca1d81f859ac0a917 $
+//
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	C_CONSOLE
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include <stdarg.h>
+#include <cmath>
+
+#include "m_alloc.h"
+#include "m_memio.h"
+#include "g_game.h"
+#include "c_console.h"
+#include "c_dispatch.h"
+#include "c_bind.h"
+#include "i_system.h"
+#include "i_video.h"
+#include "v_palette.h"
+#include "v_video.h"
+#include "v_text.h"
+#include "w_wad.h"
+#include "z_zone.h"
+#include "r_main.h"
+#include "r_interp.h"
+#include "st_stuff.h"
+#include "s_sound.h"
+#include "cl_responderkeys.h"
+#include "cl_download.h"
+#include "g_gametype.h"
+#include "m_fileio.h"
+
+#include <list>
+#include <algorithm>
+
+#ifdef __SWITCH__
+#include "nx_io.h"
+#endif
+
+#include "cl_demo.h"
+
+extern NetDemo netdemo;
+
+static constexpr int MAX_LINE_LENGTH = 8192;
+
+static bool ShouldTabCycle = false;
+static size_t NextCycleIndex = 0;
+static size_t PrevCycleIndex = 0;
+
+static IWindowSurface* background_surface;
+
+extern int		gametic;
+
+static unsigned int		ConRows, ConCols, ConCharSize, ConScale;
+
+static bool				cursoron = false;
+static int				ConBottom = 0;
+static int RowAdjust = 0;
+
+static const int		CONSOLE_WHEEL_LINES = 3;
+
+int			ConBottomStep; // Console fall/raise bottom pixels at the end of the tic, for interp purposes
+
+int			CursorTicker, ScrollState = 0;
+constate_e	ConsoleState = c_up;
+
+extern byte *ConChars;
+
+bool		KeysShifted;
+bool		KeysCtrl;
+bool		KeysAlt;
+bool		NumLockEnabled;
+
+static bool midprinting;
+
+#define SCROLLUP 1
+#define SCROLLDN 2
+#define SCROLLNO 0
+
+EXTERN_CVAR(con_scaletext)
+EXTERN_CVAR(con_coloredmessages)
+EXTERN_CVAR(con_buffersize)
+EXTERN_CVAR(show_messages)
+EXTERN_CVAR(print_stdout)
+EXTERN_CVAR(con_notifytime)
+
+EXTERN_CVAR(message_showpickups)
+EXTERN_CVAR(message_showobituaries)
+
+static unsigned int TickerAt, TickerMax;
+static const char *TickerLabel;
+
+#define NUMNOTIFIES 4
+
+int V_TextScaleXAmount();
+int V_TextScaleYAmount();
+
+static struct NotifyText
+{
+	int timeout;
+	int printlevel;
+	byte text[256];
+} NotifyStrings[NUMNOTIFIES];
+
+// Default Printlevel
+#define PRINTLEVELS 9 //(5 + 3)
+int PrintColors[PRINTLEVELS] =
+{	CR_RED,		// Pickup
+	CR_GOLD,	// Obituaries
+	CR_GRAY,	// Messages
+	CR_GREEN,	// Chat
+	CR_GREEN,	// Team chat
+
+	CR_GOLD,	// Server chat
+	CR_YELLOW,	// Warning messages
+	CR_RED,		// Critical messages
+	CR_GOLD,	// Centered Messages
+};
+
+
+// ============================================================================
+//
+// ConsoleLine class interface
+//
+// Stores the console's output text.
+//
+// ============================================================================
+
+class ConsoleLine
+{
+public:
+	ConsoleLine();
+	ConsoleLine(const std::string& _text, const std::string& _color_code = "\034-",	// TEXTCOLOR_ESCAPE
+			int _print_level = PRINT_HIGH);
+
+	void join(const ConsoleLine& other);
+	ConsoleLine split(size_t max_width);
+	[[nodiscard]] bool expired() const;
+
+	std::string		text;
+	std::string		color_code;
+	bool			wrapped;
+	int				print_level;
+	int				timeout;
+};
+
+
+// ============================================================================
+//
+// ConsoleLine class implementation
+//
+// ============================================================================
+
+ConsoleLine::ConsoleLine()
+    : color_code("\034-"), wrapped(false), print_level(PRINT_HIGH),
+      timeout(gametic + int(con_notifytime * TICRATE))
+{
+}
+
+ConsoleLine::ConsoleLine(const std::string& _text, const std::string& _color_code,
+                         int _print_level)
+    : text(_text), color_code(_color_code), wrapped(false), print_level(_print_level),
+      timeout(gametic + int(con_notifytime * TICRATE))
+{
+}
+
+
+//
+// ConsoleLine::join
+//
+// Appends the other console line to this line.
+//
+void ConsoleLine::join(const ConsoleLine& other)
+{
+	text.append(other.text);
+	wrapped = other.wrapped;
+}
+
+//
+// ConsoleLine::split
+//
+// Splits this line into a second line with this line having a maximum
+// pixel width of max_width.
+//
+ConsoleLine ConsoleLine::split(size_t max_width)
+{
+	char wrapped_color_code[4] = { 0 };
+	size_t width = 0;
+	size_t break_pos = 0;
+
+	const char* s = text.c_str();
+	while (s)
+	{
+		if (s[0] == TEXTCOLOR_ESCAPE && s[1] != '\0')
+		{
+			strncpy(wrapped_color_code, s, 2);
+			s += 2;
+			continue;
+		}
+
+		if (*s == ' ' || *s == '\n' || *s == '\t')
+			break_pos = s - text.c_str();
+		else if (*s == '-')
+			break_pos = s + 1 - text.c_str();
+
+		if (width + ConCharSize > max_width)
+		{
+			// Is this word is too long to fit on the line?
+			// Breaking it here is the only option.
+			if (break_pos == 0)
+				break_pos = s - text.c_str();
+
+			ConsoleLine new_line(text.substr(break_pos, std::string::npos));
+			TrimStringStart(new_line.text);
+
+			// continue the color markup onto the next line
+			if (*wrapped_color_code)
+				new_line.text = wrapped_color_code + new_line.text;
+
+			new_line.wrapped = wrapped;
+			new_line.print_level = print_level;
+			new_line.timeout = timeout;
+			new_line.color_code = color_code;
+
+			text = text.substr(0, break_pos);
+			wrapped = true;
+
+			return new_line;
+		}
+
+		s++;
+		width += ConCharSize;
+	}
+
+	// didn't have to wrap
+	return ConsoleLine();
+}
+
+bool ConsoleLine::expired() const
+{
+	return gametic > timeout;
+}
+
+
+
+// ============================================================================
+//
+// ConsoleCommandLine class interface
+//
+// Stores the text and cursor position for the console's command line. Also
+// provides basic functions to manipulate the cursor or insert and remove
+// characters.
+//
+// ============================================================================
+
+class ConsoleCommandLine
+{
+public:
+	ConsoleCommandLine() : cursor_position(0), scrolled_columns(0) { }
+
+	void clear();
+	void moveCursorLeft();
+	void moveCursorRight();
+	void moveCursorLeftWord();
+	void moveCursorRightWord();
+	void moveCursorHome();
+	void moveCursorEnd();
+
+	void insertCharacter(char c);
+	void insertString(const std::string& str);
+	void replaceString(const std::string& str);
+	void deleteCharacter();
+	void deleteLeftWord();
+	void deleteRightWord();
+	void backspace();
+
+	std::string		text;
+	size_t			cursor_position;
+	int			scrolled_columns;
+
+private:
+	void doScrolling();
+};
+
+
+// ============================================================================
+//
+// ConsoleCommandLine class implementation
+//
+// ============================================================================
+
+//
+// ConsoleCommandLine::doScrolling
+//
+// Helper function that recalculates the scrolled_columns variable after
+// the cursor has been moved or text has been inserted or deleted.
+//
+void ConsoleCommandLine::doScrolling()
+{
+	int n = scrolled_columns;
+
+	// Start of visible line is beyond end of line
+	if (scrolled_columns >= text.length())
+		n = cursor_position - ConCols + 2;
+
+	// The cursor_position is beyond the visible part of the line
+	if (((int)cursor_position - (int)scrolled_columns) >= (int)(ConCols - 2))
+		n = cursor_position - ConCols + 2;
+
+	// The cursor_positionor is in front of the visible part of the line
+	if (scrolled_columns > cursor_position)
+		n = cursor_position;
+
+	if (n < 0)
+		n = 0;
+
+	scrolled_columns = n;
+}
+
+void ConsoleCommandLine::clear()
+{
+	text.clear();
+	cursor_position = 0;
+	scrolled_columns = 0;
+}
+
+void ConsoleCommandLine::moveCursorLeft()
+{
+	if (cursor_position > 0)
+		cursor_position--;
+	doScrolling();
+}
+
+void ConsoleCommandLine::moveCursorRight()
+{
+	if (cursor_position < text.length())
+		cursor_position++;
+	doScrolling();
+}
+
+void ConsoleCommandLine::moveCursorLeftWord()
+{
+	const char* str = text.c_str();
+
+	bool firstSpacesCleared = false;
+	bool spaceWord = false;
+
+	if (cursor_position > 0 && isspace(str[cursor_position]))
+		firstSpacesCleared = true;
+
+	if (cursor_position > 0)
+		cursor_position--;
+
+	if (cursor_position > 0 && firstSpacesCleared)
+		spaceWord = true;
+
+	while (cursor_position > 0)
+	{
+		if (spaceWord)
+		{
+			if (!isspace(str[cursor_position - 1]))
+			{
+				break;
+			}
+		}
+		else
+		{
+			if (firstSpacesCleared && isspace(str[cursor_position - 1]))
+			{
+				break;
+			}
+			else if (!isspace(str[cursor_position - 1]) && !firstSpacesCleared)
+			{
+				firstSpacesCleared = true;
+			}
+		}
+
+		cursor_position--;
+	}
+
+	doScrolling();
+}
+
+void ConsoleCommandLine::moveCursorRightWord()
+{
+	// find first non-space character after the next space(s)
+	cursor_position = text.find_first_not_of(' ', text.find_first_of(' ', cursor_position));
+
+	if (cursor_position == std::string::npos)
+		cursor_position = text.length();
+
+	doScrolling();
+}
+
+void ConsoleCommandLine::moveCursorHome()
+{
+	cursor_position = 0;
+	doScrolling();
+}
+
+void ConsoleCommandLine::moveCursorEnd()
+{
+	cursor_position = text.length();
+	doScrolling();
+}
+
+void ConsoleCommandLine::insertCharacter(char c)
+{
+	text.insert(cursor_position, &c, 1);
+
+	cursor_position++;
+	doScrolling();
+}
+
+void ConsoleCommandLine::insertString(const std::string& str)
+{
+	text.insert(cursor_position, str);
+
+	cursor_position += str.length();
+	doScrolling();
+}
+
+void ConsoleCommandLine::replaceString(const std::string& str)
+{
+	text = str;
+
+	cursor_position = str.length();
+	doScrolling();
+}
+
+void ConsoleCommandLine::deleteCharacter()
+{
+	if (cursor_position < text.length())
+	{
+		text.erase(cursor_position, 1);
+		doScrolling();
+	}
+}
+
+
+void ConsoleCommandLine::deleteLeftWord()
+{
+	size_t word = 0;
+	bool firstSpacesCleared = false;
+	bool spaceWord = false;
+
+	const char* str = text.c_str();
+
+	// Delete trailing spaces instead of the word
+	if (cursor_position > 0 && isspace(str[cursor_position - 1]))
+	{
+		spaceWord = true;
+	}
+
+	while (cursor_position > 0)
+	{
+		if (spaceWord)
+		{
+			if (!isspace(str[cursor_position - 1]))
+			{
+				break;
+			}
+		}
+		else
+		{
+			if (firstSpacesCleared && isspace(str[cursor_position]))
+			{
+				break;
+			}
+			else if (!isspace(str[cursor_position]) && !firstSpacesCleared)
+			{
+				firstSpacesCleared = true;
+			}
+		}
+
+		cursor_position--;
+		word++;
+	}
+
+	text.erase(cursor_position, word);
+
+	doScrolling();
+}
+
+void ConsoleCommandLine::deleteRightWord()
+{
+	bool spaceWord = false;
+
+	const char* str = text.c_str();
+
+	if (cursor_position > 0 &&
+			cursor_position < text.length() &&
+			isspace(str[cursor_position]))
+	{
+		spaceWord = true;
+	}
+
+	size_t word = 0;
+	size_t wordLength = 0;
+
+	if (spaceWord)
+	{
+		word = text.find_first_not_of(' ', cursor_position);
+	}
+	else
+	{
+		word = text.find_first_not_of(' ', text.find_first_of(' ', cursor_position));
+	}
+
+	if (word == std::string::npos)
+			wordLength = text.length();
+		else
+			wordLength = word - cursor_position;
+
+	text.erase(cursor_position, wordLength);
+
+	doScrolling();
+}
+
+void ConsoleCommandLine::backspace()
+{
+	if (cursor_position > 0)
+	{
+		text.erase(cursor_position - 1, 1);
+		moveCursorLeft();
+	}
+}
+
+
+// ============================================================================
+//
+// ConsoleHistory class interface
+//
+// Stores a copy of each line of text entered on the command line and provides
+// iteration functions to recall previous command lines entered.
+//
+// ============================================================================
+
+class ConsoleHistory
+{
+public:
+	ConsoleHistory();
+
+	void clear();
+
+	void resetPosition();
+
+	void addString(const std::string& str);
+	[[nodiscard]] const std::string& getString() const;
+
+	void movePositionUp();
+	void movePositionDown();
+
+	void dump();
+
+private:
+	static constexpr size_t MAX_HISTORY_ITEMS = 50;
+
+	typedef std::list<std::string> ConsoleHistoryList;
+	ConsoleHistoryList					history;
+
+	ConsoleHistoryList::const_iterator	history_it;
+};
+
+// ============================================================================
+//
+// ConsoleHistory class implementation
+//
+// ============================================================================
+
+ConsoleHistory::ConsoleHistory()
+{
+	resetPosition();
+}
+
+void ConsoleHistory::clear()
+{
+	history.clear();
+	resetPosition();
+}
+
+void ConsoleHistory::resetPosition()
+{
+	history_it = history.end();
+}
+
+void ConsoleHistory::addString(const std::string& str)
+{
+	// only add the string if it's different from the most recent in history
+	if (!str.empty() && (history.empty() || str.compare(history.back()) != 0))
+	{
+		while (history.size() >= MAX_HISTORY_ITEMS)
+			history.pop_front();
+		history.push_back(str);
+	}
+}
+
+const std::string& ConsoleHistory::getString() const
+{
+	if (history_it == history.end())
+	{
+		static std::string blank_string;
+		return blank_string;
+	}
+
+	return *history_it;
+}
+
+void ConsoleHistory::movePositionUp()
+{
+	if (history_it != history.begin())
+		--history_it;
+}
+
+void ConsoleHistory::movePositionDown()
+{
+	if (history_it != history.end())
+		++history_it;
+}
+
+void ConsoleHistory::dump()
+{
+	for (const auto& it : history)
+		PrintFmt(PRINT_HIGH, "   {}\n", it);
+}
+
+class ConsoleCompletions
+{
+	std::vector<std::string> _completions;
+	size_t _maxlen;
+
+  public:
+	void add(const std::string& completion)
+	{
+		_completions.push_back(completion);
+		if (_maxlen < completion.length())
+			_maxlen = completion.length();
+	}
+
+	[[nodiscard]] const std::string& at(size_t index) const
+	{
+		return _completions.at(index);
+	}
+
+	void clear()
+	{
+		_completions.clear();
+		_maxlen = 0;
+	}
+
+	[[nodiscard]] bool empty() const
+	{
+		return _completions.empty();
+	}
+
+	//
+	// Get longest common substring of completions.
+	//
+	[[nodiscard]] std::string getCommon() const
+	{
+		bool diff = false;
+		std::string common;
+
+		for (size_t index = 0;; index++)
+		{
+			char compare = '\xFF';
+
+			for (const auto& comp : _completions)
+			{
+				if (index >= comp.length())
+				{
+					// End of string, this is an implicit failed match.
+					diff = true;
+					break;
+				}
+
+				if (compare == '\xFF')
+				{
+					// Set character to compare against.
+					compare = comp.at(index);
+				}
+				else if (compare != comp.at(index))
+				{
+					// Found a different character.
+					diff = true;
+					break;
+				}
+			}
+
+			// If we found a different character, break, otherwise add it
+			// to the string we're going to return and try the next index.
+			if (diff == true)
+				break;
+			else
+				common += compare;
+		}
+
+		return common;
+	}
+
+	[[nodiscard]] size_t getMaxLen() const
+	{
+		return _maxlen;
+	}
+
+	[[nodiscard]] size_t size() const
+	{
+		return _completions.size();
+	}
+};
+
+// ============================================================================
+//
+// Console object definitions
+//
+// ============================================================================
+
+typedef std::list<ConsoleLine> ConsoleLineList;
+static ConsoleLineList Lines;
+
+static ConsoleCommandLine CmdLine;
+
+static ConsoleHistory History;
+
+static ConsoleCompletions CmdCompletions;
+
+/****** Tab completion code ******/
+
+typedef std::map<std::string, size_t> tabcommand_map_t; // name, use count
+tabcommand_map_t& TabCommands()
+{
+	static tabcommand_map_t _TabCommands;
+	return _TabCommands;
+}
+
+void C_AddTabCommand(const char* name)
+{
+	const tabcommand_map_t::iterator it = TabCommands().find(StdStringToLower(name));
+
+	if (it != TabCommands().end())
+		TabCommands()[name]++;
+	else
+		TabCommands()[name] = 1;
+}
+
+void C_RemoveTabCommand(const char* name)
+{
+	const tabcommand_map_t::iterator it = TabCommands().find(StdStringToLower(name));
+
+	if (it != TabCommands().end())
+		if (!--it->second)
+			TabCommands().erase(it);
+}
+
+//
+// Start tab cycling.
+//
+// Note that this initial state points to the front and back of the completions
+// index, which is a unique state that is not possible to get into after you
+// start hitting tab.
+//
+static void TabCycleStart()
+{
+	::ShouldTabCycle = true;
+	::NextCycleIndex = 0;
+	::PrevCycleIndex = CmdCompletions.size() - 1;
+}
+
+//
+// Given an specific completion index, determine the next and previous index.
+//
+static void TabCycleSet(size_t index)
+{
+	// Find the next index.
+	if (index >= CmdCompletions.size() - 1)
+		::NextCycleIndex = 0;
+	else
+		::NextCycleIndex = index + 1;
+
+	// Find the previous index.
+	if (index == 0)
+		::PrevCycleIndex = CmdCompletions.size() - 1;
+	else
+		::PrevCycleIndex = index - 1;
+}
+
+//
+// Get out of the tab cycle state.
+//
+static void TabCycleClear()
+{
+	::ShouldTabCycle = false;
+	::NextCycleIndex = 0;
+	::PrevCycleIndex = 0;
+}
+
+enum TabCompleteDirection
+{
+	TAB_COMPLETE_FORWARD,
+	TAB_COMPLETE_BACKWARD
+};
+
+//
+// Handle tab-completion and cycling.
+//
+static void TabComplete(TabCompleteDirection dir)
+{
+	// Pressing tab twice in a row starts cycling the completion.
+	if (::ShouldTabCycle && ::CmdCompletions.size() > 0)
+	{
+		if (dir == TAB_COMPLETE_FORWARD)
+		{
+			const size_t index = ::NextCycleIndex;
+			::CmdLine.replaceString(::CmdCompletions.at(index));
+			TabCycleSet(index);
+		}
+		else if (dir == TAB_COMPLETE_BACKWARD)
+		{
+			const size_t index = ::PrevCycleIndex;
+			::CmdLine.replaceString(::CmdCompletions.at(index));
+			TabCycleSet(index);
+		}
+		return;
+	}
+
+	// Clear the completions.
+	::CmdCompletions.clear();
+
+	// Figure out what we need to autocomplete.
+	size_t tabStart = ::CmdLine.text.find_first_not_of(' ', 0);
+	if (tabStart == std::string::npos)
+		tabStart = 0;
+	size_t tabEnd = ::CmdLine.text.find(' ', 0);
+	if (tabEnd == std::string::npos)
+		tabEnd = ::CmdLine.text.length();
+	const size_t tabLen = tabEnd - tabStart;
+
+	// Don't complete if the cursor is past the command.
+	if (::CmdLine.cursor_position >= tabEnd + 1)
+		return;
+
+	// Find all substrings.
+	const std::string sTabPos = StdStringToLower(::CmdLine.text.substr(tabStart, tabLen));
+	const char* cTabPos = sTabPos.c_str();
+	tabcommand_map_t::iterator it = TabCommands().lower_bound(sTabPos);
+	for (; it != TabCommands().end(); ++it)
+	{
+		if (strncmp(cTabPos, it->first.c_str(), sTabPos.length()) == 0)
+			::CmdCompletions.add(it->first.c_str());
+	}
+
+	if (::CmdCompletions.size() > 1)
+	{
+		// Get common substring of all completions.
+		const std::string common = ::CmdCompletions.getCommon();
+		::CmdLine.replaceString(common);
+	}
+	else if (::CmdCompletions.size() == 1)
+	{
+		// We found a single completion, use it.
+		::CmdLine.replaceString(::CmdCompletions.at(0));
+		::CmdCompletions.clear();
+	}
+
+	// If we press tab twice, cycle the command.
+	TabCycleStart();
+}
+
+static void setmsgcolor(int index, const char *color);
+
+CVAR_FUNC_IMPL(msg0color)
+{
+	setmsgcolor(0, var.cstring());
+}
+
+CVAR_FUNC_IMPL(msg1color)
+{
+	setmsgcolor(1, var.cstring());
+}
+
+CVAR_FUNC_IMPL(msg2color)
+{
+	setmsgcolor(2, var.cstring());
+}
+
+CVAR_FUNC_IMPL(msg3color)
+{
+	setmsgcolor(3, var.cstring());
+}
+
+CVAR_FUNC_IMPL(msg4color)
+{
+	setmsgcolor(4, var.cstring());
+}
+
+CVAR_FUNC_IMPL(msgmidcolor)
+{
+	setmsgcolor(PRINTLEVELS-1, var.cstring());
+}
+
+CVAR_FUNC_IMPL(con_scaletext)
+{
+	C_NewModeAdjust();
+}
+
+// NES - Activating this locks the scroll position in place when
+//       scrolling up. Otherwise, any new messages will
+//       automatically pull the console back to the bottom.
+//
+// con_scrlock 0 = All new lines bring scroll to the bottom.
+// con_scrlock 1 = Only input commands bring scroll to the bottom.
+// con_scrlock 2 = Nothing brings scroll to the bottom.
+EXTERN_CVAR(con_scrlock)
+
+//
+// C_InitConCharsFont
+//
+// Loads the CONCHARS lump from disk and converts it to the format used by
+// the console for printing text.
+//
+void C_InitConCharsFont()
+{
+	static palindex_t transcolor = 0xF7;
+
+	// Load the CONCHARS lump and convert it from patch_t format
+	// to a raw linear byte buffer with a background color of 'transcolor'
+	IWindowSurface* temp_surface = I_AllocateSurface(128, 128, 8);
+	temp_surface->lock();
+
+	// fill with color 'transcolor'
+	for (int y = 0; y < 128; y++)
+		memset(temp_surface->getBuffer() + y * temp_surface->getPitchInPixels(), transcolor, 128);
+
+	// paste the patch into the linear byte bufer
+	const DCanvas* canvas = temp_surface->getDefaultCanvas();
+	canvas->DrawPatch(W_CachePatch("CONCHARS"), 0, 0);
+
+	ConChars = new byte[256*8*8*2];
+	byte* dest = ConChars;
+
+	for (int y = 0; y < 16; y++)
+	{
+		for (int x = 0; x < 16; x++)
+		{
+			const byte* source = temp_surface->getBuffer() + x * 8 + (y * 8 * temp_surface->getPitch());
+			for (int z = 0; z < 8; z++)
+			{
+				for (int a = 0; a < 8; a++)
+				{
+					const byte val = source[a];
+					if (val == transcolor)
+					{
+						dest[a] = 0x00;
+						dest[a + 8] = 0xff;
+					}
+					else
+					{
+						dest[a] = val;
+						dest[a + 8] = 0x00;
+					}
+				}
+
+				dest += 16;
+				source += temp_surface->getPitch();
+			}
+		}
+	}
+
+	temp_surface->unlock();
+	I_FreeSurface(temp_surface);
+}
+
+
+//
+// C_ShutdownConCharsFont
+//
+void C_ShutdownConCharsFont()
+{
+	delete [] ConChars;
+	ConChars = NULL;
+}
+
+//
+// C_StringWidth
+//
+// Determines the width of a string in the CONCHARS font
+//
+static int C_StringWidth(const char* str)
+{
+	int width = 0;
+
+	while (*str)
+	{
+		// skip over color markup escape codes
+		if (str[0] == TEXTCOLOR_ESCAPE && str[1] != '\0')
+		{
+			str += 2;
+			continue;
+		}
+
+		width += ConCharSize;
+		str++;
+	}
+
+	return width;
+}
+
+void C_ClearCommand()
+{
+	::CmdLine.clear();
+	::CmdCompletions.clear();
+}
+
+//
+// C_InitConsoleBackground
+//
+// Allocates background surface and draws the appropriate background patch:
+// the game's title screen.
+//
+void C_InitConsoleBackground()
+{
+	const int lump = W_CheckNumForName("TITLEPIC");
+	if (lump == -1)
+		return;
+
+	const patch_t* bg_patch = W_CachePatch(lump);
+
+	background_surface = I_AllocateSurface(bg_patch->width(), bg_patch->height(), 8);
+	background_surface->lock();
+	background_surface->getDefaultCanvas()->DrawPatch(bg_patch, 0, 0);
+	background_surface->unlock();
+}
+
+
+//
+// C_ShutdownConsoleBackground
+//
+// Frees the background_surface
+//
+void C_ShutdownConsoleBackground()
+{
+	if (background_surface != NULL)
+		I_FreeSurface(background_surface);
+	background_surface = NULL;
+}
+
+
+//
+// C_ShutdownConsole
+//
+void C_ShutdownConsole()
+{
+	Lines.clear();
+	History.clear();
+	CmdLine.clear();
+	CmdCompletions.clear();
+}
+
+
+//
+// C_InitConsole
+//
+void C_InitConsole()
+{
+	C_NewModeAdjust();
+	C_FullConsole();
+}
+
+
+//
+// C_SetConsoleDimensions
+//
+static void C_SetConsoleDimensions(int width, int height)
+{
+	static int old_width = -1, old_height = -1, old_scale = -1;
+
+	if (width != old_width || height != old_height || ConScale != old_scale)
+	{
+		ConCols = width / ConCharSize - 2;
+
+		// ConCols has changed so any lines of text that are currently wrapped
+		// need to be adjusted.
+		for (ConsoleLineList::iterator current_line_it = Lines.begin();
+			current_line_it != Lines.end(); ++current_line_it)
+		{
+			if (current_line_it->wrapped)
+			{
+				// The current line has wrapped around to the next line. Append the
+				// next line to the current line for now.
+
+				ConsoleLineList::iterator next_line_it = current_line_it;
+				++next_line_it;
+
+				if (next_line_it != Lines.end())
+				{
+					current_line_it->join(*next_line_it);
+					Lines.erase(next_line_it);
+				}
+			}
+
+			if ((unsigned)C_StringWidth(current_line_it->text.c_str()) > ConCols*ConCharSize)
+			{
+				ConsoleLineList::iterator next_line_it = current_line_it;
+				++next_line_it;
+
+				ConsoleLine new_line = current_line_it->split(ConCols*ConCharSize);
+				Lines.insert(next_line_it, new_line);
+			}
+		}
+
+		old_width = width;
+		old_height = height;
+		old_scale = ConScale;
+	}
+}
+
+static void setmsgcolor(int index, const char *color)
+{
+	int i = atoi(color);
+	if (i < 0 || i >= NUM_TEXT_COLORS)
+		i = 0;
+	PrintColors[index] = i;
+}
+
+
+//
+// C_AddNotifyString
+//
+// Prioritise messages on top of screen
+// Break up the lines so that they wrap around the screen boundary
+//
+void C_AddNotifyString(int printlevel, const char* color_code, const char* source)
+{
+	static enum
+	{
+		NEWLINE,
+		APPENDLINE,
+		REPLACELINE
+	} addtype = NEWLINE;
+
+	char work[MAX_LINE_LENGTH];
+	brokenlines_t *lines;
+
+	const size_t len = strlen(source);
+
+	if ((printlevel != 128 && !show_messages) || len == 0 ||
+		(gamestate != GS_LEVEL && gamestate != GS_INTERMISSION) )
+		return;
+
+	// Do not display filtered chat messages
+	if (printlevel == PRINT_FILTERCHAT)
+		return;
+
+	// Do not display filtered normal messages
+	if (printlevel == PRINT_FILTERHIGH)
+		return;
+
+	const int width = I_GetSurfaceWidth() / V_TextScaleXAmount();
+
+	if (addtype == APPENDLINE && NotifyStrings[NUMNOTIFIES-1].printlevel == printlevel)
+	{
+		snprintf(work, MAX_LINE_LENGTH, "%s%s", NotifyStrings[NUMNOTIFIES - 1].text, source);
+		lines = V_BreakLines(width, work);
+	}
+	else
+	{
+		lines = V_BreakLines(width, source);
+		addtype = (addtype == APPENDLINE) ? NEWLINE : addtype;
+	}
+
+	if (!lines)
+		return;
+
+	for (int i = 0; lines[i].width != -1; i++)
+	{
+		if (addtype == NEWLINE)
+			memmove(&NotifyStrings[0], &NotifyStrings[1], sizeof(struct NotifyText) * (NUMNOTIFIES-1));
+		M_StringCopy((char *)NotifyStrings[NUMNOTIFIES-1].text, lines[i].string, 256);
+		NotifyStrings[NUMNOTIFIES-1].timeout = gametic + (con_notifytime.asInt() * TICRATE);
+		NotifyStrings[NUMNOTIFIES-1].printlevel = printlevel;
+		addtype = NEWLINE;
+	}
+
+	V_FreeBrokenLines(lines);
+
+	switch (source[len-1])
+	{
+	case '\r':
+		addtype = REPLACELINE;
+		break;
+	case '\n':
+		addtype = NEWLINE;
+		break;
+	default:
+		addtype = APPENDLINE;
+		break;
+	}
+}
+
+//
+// C_PrintStringStdOut
+//
+// Prints the given string to stdout, stripping away any color markup
+// escape codes.
+//
+static size_t C_PrintStringStdOut(std::string str)
+{
+	StripColorCodes(str);
+
+	fmt::print("{}", str);
+	fflush(stdout);
+
+	return str.length();
+}
+
+
+//
+// C_PrintString
+//
+// Provide our own Printf() that is sensitive of the
+// console status (in or out of game).
+//
+static size_t C_PrintString(int printlevel, const char* color_code, const char* outline)
+{
+	if (I_VideoInitialized() && !midprinting)
+	{
+		const bool noPickups = printlevel == PRINT_PICKUP && (!::message_showpickups || displayplayer().isFreecam);
+		const bool noObits = printlevel == PRINT_OBITUARY && !::message_showobituaries;
+
+		if (!noPickups && !noObits)
+			C_AddNotifyString(printlevel, color_code, outline);
+	}
+
+	// Revert filtered chat to a normal chat to display to the console
+	if (printlevel == PRINT_FILTERCHAT)
+		printlevel = PRINT_CHAT;
+
+	if (printlevel == PRINT_FILTERHIGH)
+		printlevel = PRINT_HIGH;
+
+	const char* line_start = outline;
+	const char* line_end = line_start;
+
+	// [SL] the user's message color preference overrides the given color_code
+	// ...unless it's supposed to be formatted bold.
+	static char printlevel_color_code[3];
+
+	if (color_code && color_code[1] != '+' && printlevel >= 0 && printlevel < PRINTLEVELS)
+	{
+		snprintf(printlevel_color_code, sizeof(printlevel_color_code), "\034%c", 'a' + PrintColors[printlevel]);
+		color_code = printlevel_color_code;
+	}
+
+	while (*line_start)
+	{
+		// Find the next line-breaking character (\n or \0) and set
+		// line_end to point to it.
+		line_end = line_start;
+		while (*line_end != '\n' && *line_end != '\0')
+			 line_end++;
+
+		const size_t len = line_end - line_start;
+
+		char str[MAX_LINE_LENGTH + 1];
+		strncpy(str, line_start, len);
+		str[len] = '\0';
+
+		const bool wrap_new_line = *line_end != '\n';
+		ConsoleLine new_line(str, color_code, wrap_new_line);
+
+		// Add a new line to ConsoleLineList if the last line in ConsoleLineList
+		// ends in \n, or add onto the last line if does not.
+		if (!Lines.empty() && Lines.back().wrapped)
+			Lines.back().join(new_line);
+		else
+			Lines.push_back(new_line);
+
+		// Wrap the current line if it's too long.
+		const unsigned int line_width = C_StringWidth(Lines.back().text.c_str());
+		if (line_width > ConCols*ConCharSize)
+		{
+			new_line = Lines.back().split(ConCols*ConCharSize);
+			Lines.push_back(new_line);
+		}
+
+		if (con_scrlock > 0 && RowAdjust != 0)
+			RowAdjust++;
+		else
+			RowAdjust = 0;
+
+		line_start = line_end;
+		if (*line_end == '\n')
+			line_start++;
+	}
+
+	return strlen(outline);
+}
+
+size_t C_BasePrint(const int printlevel, const char* color_code, const std::string& str)
+{
+	extern bool gameisdead;
+	if (gameisdead)
+		return 0;
+
+	std::string newStr = str;
+
+	// denis - 0x07 is a system beep, which can DoS the console (lol)
+	// ToDo: there may be more characters not allowed on a consoleprint,
+	// maybe restrict a few ASCII stuff later on ?
+	for (auto& c : newStr)
+	{
+		if (c == 0x07)
+			c = '.';
+	}
+
+	// Prevents writing a whole lot of new lines to the log file
+	if (gamestate != GS_FORCEWIPE)
+	{
+		std::string logStr = newStr;
+
+		// [Nes] - Horizontal line won't show up as-is in the logfile.
+		for (auto& c : logStr)
+		{
+			if (c == '\35' || c == '\36' || c == '\37')
+				c = '=';
+		}
+
+		// Up the row buffer for the console.
+		// This is incremented here so that any time we
+		// print something we know about it.  This feels pretty hacky!
+
+		// We need to know if there were any new lines being printed
+		// in our string.
+		const int newLineCount = std::count(logStr.begin(), logStr.end(), '\n');
+
+		if (ConRows < (unsigned int)con_buffersize.asInt())
+			ConRows += (newLineCount > 1) ? newLineCount + 1 : 1;
+	}
+
+	if (print_stdout && gamestate != GS_FORCEWIPE)
+		C_PrintStringStdOut(newStr);
+
+	if (!con_coloredmessages)
+		StripColorCodes(newStr);
+
+	C_PrintString(printlevel, color_code, newStr.c_str());
+
+	// Once done, log
+	if (LOG.is_open())
+	{
+		// Strip if not already done
+		if (con_coloredmessages)
+			StripColorCodes(newStr);
+
+		LOG << newStr;
+		LOG.flush();
+	}
+
+#if defined (_WIN32) && defined(_DEBUG)
+	// [AM] Since we don't have stdout/stderr in a non-console Win32 app,
+	//      this outputs the string to the "Output" window.
+	OutputDebugStringA(newStr.c_str());
+#endif
+
+	return newStr.length();
+}
+
+void C_FlushDisplay()
+{
+	for (auto& notify : NotifyStrings)
+		notify.timeout = 0;
+}
+
+void C_Ticker()
+{
+	const int surface_height = I_GetSurfaceHeight();
+
+	if (ConsoleState == c_falling)
+	{
+		ConBottomStep += (surface_height * 2 / 25);
+	}
+	else if (ConsoleState == c_fallfull)
+	{
+		ConBottomStep += (surface_height * 2 / 15);
+	}
+	else if (ConsoleState == c_rising)
+	{
+		ConBottomStep -= (surface_height * 2 / 25);
+	}
+	else if (ConsoleState == c_risefull)
+	{
+		ConBottomStep -= (surface_height * 2 / 15);
+	}
+	else if (ConsoleState == c_up)
+	{
+		// Console suddenly snapped up? Don't interp it anymore.
+		ConBottomStep = 0;
+	}
+
+	if (ConsoleState != c_up)
+	{
+		if (ScrollState == SCROLLUP)
+		{
+			if (KeysCtrl)
+			{
+				RowAdjust += 16;
+				ScrollState = SCROLLNO;
+			}
+			else
+				RowAdjust++;
+
+			if (RowAdjust > ConRows - ConBottom / ConCharSize)
+				RowAdjust = ConRows - ConBottom / ConCharSize;
+		}
+		else if (ScrollState == SCROLLDN)
+		{
+			if (KeysCtrl)
+			{
+				RowAdjust-=16;
+				ScrollState = SCROLLNO;
+			} else
+				RowAdjust--;
+
+			if (RowAdjust < 0)
+				RowAdjust = 0;
+		}
+
+		if (RowAdjust + (ConBottom/ConCharSize) + 1 > (unsigned int)con_buffersize.asInt())
+			RowAdjust = con_buffersize.asInt() - (ConBottom/ConCharSize);
+	}
+
+	if (--CursorTicker <= 0)
+	{
+		cursoron ^= 1;
+		CursorTicker = C_BLINKRATE;
+	}
+
+	OInterpolation::getInstance().beginConsoleInterpolation(render_lerp_amount);
+}
+
+
+//
+// C_DrawNotifyText
+//
+// Prints the HUD notification messages to the top of the HUD. Each of these
+// messages will be displayed for a fixed amount of time before being removed.
+//
+static void C_DrawNotifyText()
+{
+	if ((gamestate != GS_LEVEL && gamestate != GS_INTERMISSION) || menuactive)
+		return;
+
+	int ypos = 0;
+	for (const auto& notify : NotifyStrings)
+	{
+		if (notify.timeout > gametic)
+		{
+			if (!show_messages && notify.printlevel != 128)
+				continue;
+
+			int color;
+			if (notify.printlevel >= PRINTLEVELS)
+				color = CR_RED;
+			else
+				color = PrintColors[notify.printlevel];
+
+			screen->DrawTextStretched(color, 0, ypos, notify.text,
+						V_TextScaleXAmount(), V_TextScaleYAmount());
+			ypos += 8 * V_TextScaleYAmount();
+		}
+	}
+}
+
+
+void C_InitTicker(const char *label, unsigned int max)
+{
+	TickerMax = max;
+	TickerLabel = label;
+	TickerAt = 0;
+}
+
+void C_SetTicker(unsigned int at)
+{
+	TickerAt = at > TickerMax ? TickerMax : at;
+}
+
+
+//
+// C_UseFullConsole
+//
+// Returns true if the console should be drawn fullscreen. This should be
+// any time the client is not in a level, intermission or playing the demo loop.
+static bool C_UseFullConsole()
+{
+	return (gamestate != GS_LEVEL && gamestate != GS_DEMOSCREEN && gamestate != GS_INTERMISSION);
+}
+
+
+//
+// C_AdjustBottom
+//
+// Changes ConBottom based on the console's state. In a fullscreen console,
+// ConBottom should be the bottom of the screen. Otherwise, it should be
+// the middle of the screen.
+//
+void C_AdjustBottom()
+{
+	const unsigned int surface_height = I_GetSurfaceHeight();
+
+	if (ConsoleState == c_up)
+		ConBottom = 0;
+	else if (C_UseFullConsole())
+		ConBottom = surface_height;
+	else if (ConsoleState == c_down || ConBottom > surface_height / 2)
+		ConBottom = surface_height / 2;
+
+	// don't adjust if the console is raising or lowering because C_Ticker
+	// handles that already
+}
+
+
+//
+// C_NewModeAdjust
+//
+// Reinitializes the console after a video mode change.
+//
+void C_NewModeAdjust()
+{
+	const int surface_width = I_GetSurfaceWidth(), surface_height = I_GetSurfaceHeight();
+
+	ConScale = con_scaletext ? con_scaletext : MAX(1, static_cast<int>(std::round(surface_height / 450.0f)));
+	ConCharSize = 8 * ConScale;
+
+	if (I_VideoInitialized())
+		C_SetConsoleDimensions(surface_width, surface_height);
+	else
+		C_SetConsoleDimensions(80 * ConCharSize, 25 * ConCharSize);
+
+	// clear HUD notify text
+	C_FlushDisplay();
+
+	C_AdjustBottom();
+}
+
+
+//
+//	C_FullConsole
+//
+void C_FullConsole()
+{
+	// SoM: disconnect effect.
+	if ((gamestate == GS_LEVEL || gamestate == GS_INTERMISSION) && ConsoleState == c_up && !menuactive)
+		screen->Dim(0, 0, I_GetSurfaceWidth(), I_GetSurfaceHeight());
+
+	ConsoleState = c_down;
+
+	TabCycleClear();
+
+	C_AdjustBottom();
+}
+
+
+//
+// C_HideConsole
+//
+// Sets the console's state to hidden.
+//
+void C_HideConsole()
+{
+	ConsoleState = c_up;
+	ConBottom = 0;
+	CmdLine.clear();
+	CmdCompletions.clear();
+	History.resetPosition();
+}
+
+
+static void PauseResumeSound(bool pause_sound)
+{
+	if (gamestate != GS_LEVEL || multiplayer || demoplayback || netdemo.isPlaying())
+	{
+		return;
+	}
+
+	if (pause_sound)
+	{
+		S_PauseSound();
+	}
+	else
+	{
+		S_ResumeSound();
+	}
+}
+
+//
+// C_ToggleConsole
+//
+// Toggles the console's state (if possible). This has no effect in fullscreen
+// console mode.
+//
+void C_ToggleConsole()
+{
+	if (C_UseFullConsole())
+		return;
+
+	const bool bring_console_down =
+				(ConsoleState == c_up || ConsoleState == c_rising || ConsoleState == c_risefull);
+
+	if (bring_console_down)
+	{
+		if (C_UseFullConsole())
+			ConsoleState = c_fallfull;
+		else
+			ConsoleState = c_falling;
+
+		TabCycleClear();
+	}
+	else
+	{
+		if (ConBottom == I_GetSurfaceHeight())
+			ConsoleState = c_risefull;
+		else
+			ConsoleState = c_rising;
+
+		C_FlushDisplay();
+	}
+
+	CmdLine.clear();
+	CmdCompletions.clear();
+	History.resetPosition();
+	PauseResumeSound(bring_console_down);
+}
+
+
+//
+// C_DisplayTicker
+//
+// This allows us to tic things separate from the gametics
+// So we can enable smoother display of console falling/rising
+//
+void C_DisplayTicker()
+{
+	unsigned int surface_height = I_GetSurfaceHeight();
+
+	// Attaching ConBottom to gametic will still cause falling/rising to
+	// be pinned to the gametic i.e. 35fps.
+
+	// Interp where the console bottom should be based on current and previous
+	fixed_t bottom =
+		OInterpolation::getInstance().getInterpolatedConsoleBottom(render_lerp_amount);
+
+	if (ConsoleState == c_falling)
+	{
+		ConBottom = bottom;
+		if (ConBottom >= surface_height / 2)
+		{
+			ConBottom = surface_height / 2;
+			ConBottomStep = surface_height / 2;
+			ConsoleState = c_down;
+		}
+	}
+	else if (ConsoleState == c_fallfull)
+	{
+		ConBottom = bottom;
+		if (ConBottom >= surface_height)
+		{
+			ConBottom = surface_height;
+			ConBottomStep = surface_height;
+			ConsoleState = c_down;
+		}
+	}
+	else if (ConsoleState == c_rising)
+	{
+		ConBottom = bottom;
+		if (ConBottom <= 0)
+		{
+			ConsoleState = c_up;
+			ConBottom = 0;
+			ConBottomStep = 0;
+		}
+	}
+	else if (ConsoleState == c_risefull)
+	{
+		ConBottom = bottom;
+		if (ConBottom <= 0)
+		{
+			ConsoleState = c_up;
+			ConBottom = 0;
+			ConBottomStep = 0;
+		}
+	}
+
+	if (RowAdjust + (ConBottom / ConCharSize) + 1 > (unsigned int)con_buffersize.asInt())
+		RowAdjust = con_buffersize.asInt() - (ConBottom / ConCharSize);
+}
+
+
+//
+// C_DrawConsole
+//
+void C_DrawConsole()
+{
+	#define CONPX(A) ((A) * ConScale)
+
+	IWindowSurface* primary_surface = I_GetPrimarySurface();
+	int primary_surface_width = primary_surface->getWidth();
+	int primary_surface_height = primary_surface->getHeight();
+
+	int left = CONPX(8);
+	int lines = (ConBottom - CONPX(12)) / CONPX(8);
+
+	int offset;
+	if (lines * CONPX(8) > ConBottom - CONPX(16))
+		offset = CONPX(-16);
+	else
+		offset = CONPX(-12);
+
+	if (ConsoleState == c_up || ConBottom == 0)
+	{
+		C_DrawNotifyText();
+		return;
+	}
+
+	if (!C_UseFullConsole())
+	{
+		// Non-fullscreen console. Overlay a translucent background.
+		screen->Dim(0, 0, primary_surface_width, ConBottom);
+	}
+	else
+	{
+		// Fullscreen console. Scale the title screen to fit at Doom's 4:3
+		// aspect ratio, centered on a black background, and dim it so the
+		// text stays readable.
+		screen->Clear(0, 0, primary_surface_width, primary_surface_height, argb_t(0, 0, 0));
+
+		if (::background_surface != NULL)
+		{
+			int h = primary_surface_height;
+			int w = h * 4 / 3;
+			if (w > primary_surface_width)
+			{
+				w = primary_surface_width;
+				h = w * 3 / 4;
+			}
+			int x = (primary_surface_width - w) / 2;
+			int y = (primary_surface_height - h) / 2;
+
+			background_surface->lock();
+
+			primary_surface->blit(background_surface, 0, 0,
+					background_surface->getWidth(), background_surface->getHeight(),
+					x, y, w, h);
+
+			background_surface->unlock();
+
+			screen->Dim(x, y, w, h);
+		}
+	}
+
+	if (ConBottom >= CONPX(12))
+	{
+		if (CL_IsDownloading())
+		{
+			// Use the remaining space for a download bar.
+			size_t chars = (primary_surface_width - CONPX(8)) / C_StringWidth(" ");
+			std::string download;
+
+			// Stamp out the text bits.
+			std::string filename = M_ExtractFileName(CL_DownloadFilename());
+			if (filename.empty())
+				filename = "...";
+			OTransferProgress progress = CL_DownloadProgress();
+			std::string dlnow;
+			StrFormatBytes(dlnow, progress.dlnow);
+			std::string dltotal;
+			StrFormatBytes(dltotal, progress.dltotal);
+			download = fmt::sprintf("%s: %s/%s", filename.c_str(), dlnow.c_str(),
+			                        dltotal.c_str());
+
+			// Avoid divide by zero.
+			if (progress.dltotal == 0)
+				progress.dltotal = 1;
+
+			// Stamp out the bar...if we have enough room - if we at tiny
+			// resolutions we may not.
+			size_t dltxtlen = download.length();
+			size_t barchars = chars - dltxtlen;
+
+			if (barchars >= 2 && barchars <= chars)
+			{
+				download.resize(chars);
+				for (size_t i = 0; i < barchars; i++)
+				{
+					char ch = '\30'; // empty middle
+					if (i == 0)
+						ch = '\27'; // empty left
+					else if (i == barchars - 1)
+						ch = '\31'; // empty right
+
+					double barpct = i / (double)barchars;
+					double dlpct = progress.dlnow / (double)progress.dltotal;
+
+					if (dlpct > barpct)
+						ch += 3; // full bar
+
+					download.at(i + dltxtlen) = ch;
+				}
+			}
+
+			// Draw the thing.
+			screen->PrintStr(left + CONPX(2), ConBottom - CONPX(12), download.c_str(), CR_GREEN, true, ConScale);
+		}
+		else
+		{
+			const char* version = NiceVersion();
+
+			// print the Odamex version in gold in the bottom right corner of console
+			screen->PrintStr(primary_surface_width - CONPX(8) - C_StringWidth(version),
+			                 ConBottom - CONPX(12), version, CR_ORANGE, true, ConScale);
+		}
+
+		if (TickerMax)
+		{
+			char tickstr[256];
+			size_t i, tickend = ConCols - primary_surface_width / CONPX(90) - 6;
+			size_t tickbegin = 0;
+
+			if (TickerLabel)
+			{
+				tickbegin = strlen(TickerLabel) + 2;
+				tickend -= tickbegin;
+				snprintf(tickstr, 256, "%s: ", TickerLabel);
+			}
+			if (tickend > 256 - 8)
+				tickend = 256 - 8;
+			tickstr[tickbegin] = -128;
+			memset(tickstr + tickbegin + 1, 0x81, tickend - tickbegin);
+			tickstr[tickend + 1] = -126;
+			tickstr[tickend + 2] = ' ';
+			i = tickbegin + 1 + (TickerAt * (tickend - tickbegin - 1)) / TickerMax;
+			if (i > tickend)
+				i = tickend;
+			tickstr[i] = -125;
+			size_t buflen = 256 - tickend - 3;
+			snprintf(tickstr + tickend + 3, buflen, "%u%%", (TickerAt * 100) / TickerMax);
+			screen->PrintStr(CONPX(8), ConBottom - CONPX(12), tickstr, -1, true, ConScale);
+		}
+	}
+
+	if (menuactive)
+		return;
+
+	if (lines > 0)
+	{
+		// First draw any completions, if we have any.
+		if (!::CmdCompletions.empty())
+		{
+			// True if we have too many completions to render all of them.
+			bool cOverflow = false;
+
+			// We want at least 8-space tabs.
+			size_t cTabLen = (::CmdCompletions.getMaxLen() + 1);
+			if (cTabLen < 8)
+				cTabLen = 8;
+
+			// How many columns can we fit on the screen at one time?
+			size_t cColumns = ::ConCols / cTabLen;
+			if (cColumns == 0)
+				cColumns += 1;
+
+			// Given the number of columns, how many lines do we need?
+			size_t cLines = ::CmdCompletions.size() / cColumns;
+			if (::CmdCompletions.size() % cColumns != 0)
+				cLines += 1;
+
+			// Currently we cap the number of completion lines to 5
+			if (cLines > 5)
+			{
+				cLines = 5;
+				cOverflow = true;
+			}
+
+			// Offset our standard console printing.
+			if (cOverflow)
+				lines -= cLines + 1;
+			else
+				lines -= cLines;
+
+			static char rowstring[MAX_LINE_LENGTH];
+
+			// Completions are rendered top to bottom in columns like a
+			// backwards "N".
+			for (size_t l = 0; l < cLines; l++)
+			{
+				// Prepare a row string to copy completions into.
+				memset(rowstring, ' ', ARRAY_LENGTH(rowstring));
+				size_t col = 0;
+
+				for (size_t c = 0; c < cColumns; c++)
+				{
+					// Turn our current line/column into an index.
+					size_t index = (c * cLines) + l;
+					if (index >= ::CmdCompletions.size())
+					{
+						rowstring[col] = '\0';
+						break;
+					}
+
+					// Copy our completion into the row.
+					const std::string& str = ::CmdCompletions.at(index);
+					memcpy(&rowstring[col], str.c_str(), str.length());
+					col += cTabLen;
+
+					if (c + 1 == cColumns)
+						rowstring[col - 1] = '\0';
+					else
+						rowstring[col - 1] = ' ';
+				}
+
+				screen->PrintStr(left, offset + (lines + l + 1) * CONPX(8), rowstring,
+				                 CR_YELLOW, true, ConScale);
+			}
+
+			// Render an overflow message if necessary.
+			if (cOverflow)
+			{
+				snprintf(rowstring, ARRAY_LENGTH(rowstring), "...and %zu more...",
+				         ::CmdCompletions.size() - (cLines * cColumns));
+				screen->PrintStr(left, offset + (lines + cLines + 1) * CONPX(8), rowstring,
+				                 CR_YELLOW, true, ConScale);
+			}
+		}
+
+		// find the ConsoleLine that will be printed to bottom of the console
+		ConsoleLineList::reverse_iterator current_line_it = Lines.rbegin();
+		for (unsigned i = 0; i < RowAdjust && current_line_it != Lines.rend(); i++)
+			++current_line_it;
+
+		// print as many ConsoleLines as will fit in the screen, starting at the bottom
+		for (; lines > 1 && current_line_it != Lines.rend(); lines--, ++current_line_it)
+		{
+			const char* str = current_line_it->text.c_str();
+			const char* color_code = current_line_it->color_code.c_str();
+			int color = color_code[0] != '\0' ? V_GetTextColor(color_code) : CR_GRAY;
+			screen->PrintStr(left, offset + lines * CONPX(8), str, color, true, ConScale);
+		}
+
+		if (ConBottom >= CONPX(20))
+		{
+			screen->PrintStr(left, ConBottom - CONPX(20), "]", CR_TAN, true, ConScale);
+
+			size_t cmdline_len = std::min<size_t>(CmdLine.text.length() - CmdLine.scrolled_columns, ConCols - 1);
+			if (cmdline_len)
+			{
+				char str[MAX_LINE_LENGTH];
+				strncpy(str, CmdLine.text.c_str() + CmdLine.scrolled_columns, cmdline_len);
+				str[cmdline_len] = '\0';
+				bool use_color_codes = false;
+				screen->PrintStr(left + CONPX(8), ConBottom - CONPX(20), str, CR_GRAY, use_color_codes, ConScale);
+			}
+
+			if (cursoron)
+			{
+				const char str[] = "_";
+				size_t cursor_offset = CmdLine.cursor_position - CmdLine.scrolled_columns;
+				screen->PrintStr(left + CONPX(8) + CONPX(8) * cursor_offset, ConBottom - CONPX(20), str, CR_TAN, true, ConScale);
+			}
+
+			if (RowAdjust && ConBottom >= CONPX(28))
+			{
+				// Indicate that the view has been scrolled up (10)
+				// and if we can scroll no further (12)
+				const char scrolled_up_str[] = "\012";		// 10 = \012 octal
+				const char no_scroll_str[] = "\014";		// 12 = \014 octal
+				const char* str = (RowAdjust + ConBottom/CONPX(8) < ConRows) ? scrolled_up_str : no_scroll_str;
+				screen->PrintStr(0, ConBottom - CONPX(28), str, -1, true, ConScale);
+			}
+		}
+	}
+
+	#undef CONPX
+}
+
+
+static bool C_HandleKey(const event_t* ev)
+{
+	const int ch = ev->data1;
+	const char* cmd = Bindings.GetBind(ev->data1).c_str();
+
+	if (Key_IsMenuKey(ch) || (cmd && stricmp(cmd, "toggleconsole") == 0))
+	{
+		// don't eat the Esc key if we're in full console
+		// let it be processed elsewhere (to bring up the menu)
+		if (C_UseFullConsole())
+			return false;
+
+		C_ToggleConsole();
+		return true;
+	}
+
+#ifdef __SWITCH__
+	if (ev->data1 == OKEY_JOY3)
+	{
+		char oldtext[64], text[64], fulltext[65];
+
+		M_StringCopy(text, CmdLine.text.c_str(), 64);
+
+		// Initiate the console
+		NX_SetKeyboard(text, 64);
+
+		// No action if no text or same as earlier
+		if (!strlen(text) || !strcmp(oldtext, text))
+			return true;
+
+				// add command line text to history
+		History.addString(text);
+		History.resetPosition();
+
+		PrintFmt(127, "]{}\n", text);
+		AddCommandString(text);
+		CmdLine.clear();
+	}
+#endif
+
+	// Add modifiers for these keys
+	KeysCtrl = (ev->mod & OMOD_CTRL);
+	KeysAlt = (ev->mod & OMOD_ALT && !(ev->mod & OMOD_RALT && ev->mod & OMOD_LCTRL)); // Alt without AltGr
+	KeysShifted = (ev->mod & OMOD_SHIFT);
+	NumLockEnabled = (ev->mod & OMOD_NUM);
+
+	switch (ch)
+	{
+	case OKEY_BACKSPACE:
+		if (KeysCtrl)
+		{
+			CmdLine.deleteLeftWord();
+			TabCycleClear();
+			return true;
+		}
+		else
+		{
+			CmdLine.backspace();
+			TabCycleClear();
+			return true;
+		}
+	case OKEY_MOUSE2:
+	case OKEY_MOUSE3:
+		// Paste from clipboard - add each character to command line
+		CmdLine.insertString(I_GetClipboardText(ch == OKEY_MOUSE3));
+		CmdCompletions.clear();
+		TabCycleClear();
+		return true;
+	}
+
+// General keys used by all systems
+	{
+		if (Key_IsHomeKey(ch, NumLockEnabled))
+		{
+			CmdLine.moveCursorHome();
+			return true;
+		}
+		else if (Key_IsEndKey(ch, NumLockEnabled))
+		{
+			CmdLine.moveCursorEnd();
+			return true;
+		}
+		else if (Key_IsDelKey(ch, NumLockEnabled))
+		{
+			if (KeysAlt)
+			{
+				CmdLine.deleteRightWord();
+				TabCycleClear();
+				return true;
+			}
+			else
+			{
+				CmdLine.deleteCharacter();
+				TabCycleClear();
+				return true;
+			}
+		}
+		else if (Key_IsPageUpKey(ch, NumLockEnabled))
+		{
+			if ((int)(ConRows) > (int)(ConBottom / ConCharSize))
+			{
+				if (KeysShifted)
+					// Move to top of console buffer
+					RowAdjust = ConRows - ConBottom / ConCharSize;
+				else
+					// Start scrolling console buffer up
+					ScrollState = SCROLLUP;
+			}
+			return true;
+		}
+		else if (Key_IsPageDownKey(ch, NumLockEnabled))
+		{
+			if (KeysShifted)
+				// Move to bottom of console buffer
+				RowAdjust = 0;
+			else
+				// Start scrolling console buffer down
+				ScrollState = SCROLLDN;
+			return true;
+		}
+		else if (ch == OKEY_MWHEELUP)
+		{
+			// Scroll the console buffer up a few lines at a time
+			if (static_cast<int>(ConRows) > static_cast<int>(ConBottom / ConCharSize))
+			{
+				RowAdjust += CONSOLE_WHEEL_LINES;
+				if (RowAdjust > static_cast<int>(ConRows - ConBottom / ConCharSize))
+					RowAdjust = ConRows - ConBottom / ConCharSize;
+			}
+			return true;
+		}
+		else if (ch == OKEY_MWHEELDOWN)
+		{
+			RowAdjust -= CONSOLE_WHEEL_LINES;
+			if (RowAdjust < 0)
+				RowAdjust = 0;
+			return true;
+		}
+		else if (Key_IsLeftKey(ch, NumLockEnabled))
+		{
+			if (KeysCtrl)
+				CmdLine.moveCursorLeftWord();
+			else
+				CmdLine.moveCursorLeft();
+			return true;
+		}
+		else if (Key_IsRightKey(ch, NumLockEnabled))
+		{
+			if (KeysCtrl)
+				CmdLine.moveCursorRightWord();
+			else
+				CmdLine.moveCursorRight();
+			return true;
+		}
+		else if (Key_IsUpKey(ch, NumLockEnabled))
+		{
+			// Move to previous entry in the command history
+			History.movePositionUp();
+			CmdLine.clear();
+			CmdLine.insertString(History.getString());
+			CmdCompletions.clear();
+			TabCycleClear();
+			return true;
+		}
+		else if (Key_IsDownKey(ch, NumLockEnabled))
+		{
+			// Move to next entry in the command history
+			History.movePositionDown();
+			CmdLine.clear();
+			CmdLine.insertString(History.getString());
+			CmdCompletions.clear();
+			TabCycleClear();
+			return true;
+		}
+		else if (Key_IsAcceptKey(ch))
+		{
+			// Execute command line (ENTER)
+			if (con_scrlock == 1) // NES - If con_scrlock = 1, send console scroll to bottom.
+				RowAdjust = 0;   // con_scrlock = 0 does it automatically.
+
+			// add command line text to history
+			History.addString(CmdLine.text);
+			History.resetPosition();
+
+			PrintFmt(127, "]{}\n", CmdLine.text.c_str());
+			AddCommandString(CmdLine.text.c_str());
+			CmdLine.clear();
+			CmdCompletions.clear();
+
+			TabCycleClear();
+			return true;
+		}
+		else if (Key_IsTabulationKey(ch))
+		{
+			if (::KeysShifted)
+				TabComplete(TAB_COMPLETE_BACKWARD);
+			else
+				TabComplete(TAB_COMPLETE_FORWARD);
+			return true;
+		}
+	}
+
+	const char keytext = ev->data3;
+
+	if (KeysCtrl)
+	{
+		// handle key combinations
+		// NOTE: we have to use ev->data1 here instead of the
+		// localization-aware ev->data3 since SDL2 does not send a SDL_TEXTINPUT
+		// event when Ctrl is held down.
+
+		// Go to beginning of line
+ 		if (tolower(ev->data1) == 'a')
+			CmdLine.moveCursorHome();
+
+		// Go to end of line
+ 		if (tolower(ev->data1) == 'e')
+			CmdLine.moveCursorEnd();
+
+		// Paste from clipboard - add each character to command line
+ 		if (tolower(ev->data1) == 'v')
+		{
+			CmdLine.insertString(I_GetClipboardText());
+			TabCycleClear();
+		}
+		return true;
+	}
+
+	if (KeysAlt)
+	{
+		// Paste from primary selection - add each character to command line
+ 		if (tolower(ev->data1) == 'v')
+		{
+			CmdLine.insertString(I_GetClipboardText(true));
+			TabCycleClear();
+		}
+		return true;
+	}
+
+	if (keytext)
+	{
+		// Add keypress to command line
+		CmdLine.insertCharacter(keytext);
+		TabCycleClear();
+	}
+	return true;
+}
+
+bool C_Responder(event_t *ev)
+{
+	if (ConsoleState == c_up || ConsoleState == c_rising || ConsoleState == c_risefull || menuactive)
+		return false;
+
+	if (ev->type == ev_keyup)
+	{
+		// General Keys used by all systems
+		if (Key_IsPageUpKey(ev->data1, NumLockEnabled) || Key_IsPageDownKey(ev->data1, NumLockEnabled))
+		{
+			ScrollState = SCROLLNO;
+		}
+		else
+		{
+				return false;
+		}
+	}
+	else if (ev->type == ev_keydown)
+	{
+		return C_HandleKey(ev);
+	}
+
+	if(ev->type == ev_mouse)
+		return true;
+
+	return false;
+}
+
+BEGIN_COMMAND(history)
+{
+	History.dump();
+}
+END_COMMAND(history)
+
+BEGIN_COMMAND(clear)
+{
+	RowAdjust = 0;
+	C_FlushDisplay();
+	Lines.clear();
+	History.resetPosition();
+	CmdLine.clear();
+	CmdCompletions.clear();
+}
+END_COMMAND(clear)
+
+BEGIN_COMMAND(echo)
+{
+	if (argc > 1)
+	{
+		const std::string str = C_ArgCombine(argc - 1, (const char **)(argv + 1));
+		PrintFmt(PRINT_HIGH, "{}\n", str);
+	}
+}
+END_COMMAND(echo)
+
+
+BEGIN_COMMAND(toggleconsole)
+{
+	C_ToggleConsole();
+}
+END_COMMAND(toggleconsole)
+
+/* Printing in the middle of the screen */
+
+static brokenlines_t *MidMsg = NULL;
+static int MidTicker = 0, MidLines;
+EXTERN_CVAR(con_midtime)
+
+void C_MidPrint(const char *msg, player_t *p, int msgtime)
+{
+	unsigned int i;
+
+	const float fmsgtime = msgtime ? float(msgtime) : con_midtime;
+
+	if (MidMsg)
+		V_FreeBrokenLines(MidMsg);
+
+	if (msg)
+	{
+		midprinting = true;
+
+		// [Russell] - convert textual "\n" into the binary representation for
+		// line breaking
+		std::string str = msg;
+
+		for (size_t pos = str.find("\\n"); pos != std::string::npos; pos = str.find("\\n", pos))
+		{
+			str[pos] = '\n';
+			str.erase(pos+1, 1);
+		}
+
+		char *newmsg = strdup(str.c_str());
+
+		PrintFmt(PRINT_HIGH, "{}\n", newmsg);
+		midprinting = false;
+
+		if ( (MidMsg = V_BreakLines(I_GetSurfaceWidth() / V_TextScaleXAmount(), (byte *)newmsg)) )
+		{
+			MidTicker = (int)(fmsgtime * TICRATE) + gametic;
+
+			for (i = 0; MidMsg[i].width != -1; i++)
+				;
+
+			MidLines = i;
+		}
+
+		M_Free(newmsg);
+	}
+	else
+		MidMsg = NULL;
+}
+
+void C_DrawMid()
+{
+	if (MidMsg && not displayplayer().isFreecam)
+	{
+		const int surface_width = I_GetSurfaceWidth(), surface_height = I_GetSurfaceHeight();
+
+		const int xscale = V_TextScaleXAmount();
+		const int yscale = V_TextScaleYAmount();
+
+		const int line_height = 8 * yscale;
+
+		const int bottom = R_StatusBarVisible()
+			                   ? ST_StatusBarY(surface_width, surface_height) : surface_height;
+
+		const int x = surface_width / 2;
+		int y = (bottom - line_height * MidLines) / 2;
+
+		for (int i = 0; i < MidLines; i++, y += line_height)
+		{
+			screen->DrawTextStretched(PrintColors[PRINTLEVELS-1],
+					x - xscale * (MidMsg[i].width / 2),
+					y, (byte *)MidMsg[i].string, xscale, yscale);
+		}
+
+		if (gametic >= MidTicker)
+		{
+			V_FreeBrokenLines(MidMsg);
+			MidMsg = NULL;
+		}
+	}
+}
+
+static brokenlines_t *GameMsg = NULL;
+static int GameTicker = 0, GameColor = CR_GREY, GameLines;
+
+// [AM] This is literally the laziest excuse of a copy-paste job I have ever
+//      done, but I really want CTF messages in time for 0.6.2.  Please replace
+//      me eventually.  The two statics above, the two functions below, and
+//      any direct calls to these two functions are all you need to remove.
+void C_GMidPrint(const char* msg, int color, int msgtime)
+{
+	unsigned int i;
+
+	const float fmsgtime = msgtime ? float(msgtime) : con_midtime;
+
+	if (GameMsg)
+		V_FreeBrokenLines(GameMsg);
+
+	if (msg)
+	{
+		// [Russell] - convert textual "\n" into the binary representation for
+		// line breaking
+		std::string str = msg;
+
+		for (size_t pos = str.find("\\n");pos != std::string::npos;pos = str.find("\\n", pos))
+		{
+			str[pos] = '\n';
+			str.erase(pos + 1, 1);
+		}
+
+		char *newmsg = strdup(str.c_str());
+
+		if ((GameMsg = V_BreakLines(I_GetSurfaceWidth() / V_TextScaleXAmount(), (byte *)newmsg)) )
+		{
+			GameTicker = (int)(fmsgtime * TICRATE) + gametic;
+
+			for (i = 0;GameMsg[i].width != -1;i++)
+				;
+
+			GameLines = i;
+		}
+
+		GameColor = color;
+		M_Free(newmsg);
+	}
+	else
+	{
+		GameMsg = NULL;
+		GameColor = CR_GREY;
+	}
+}
+
+void C_DrawGMid()
+{
+	if (GameMsg)
+	{
+		const int surface_width = I_GetSurfaceWidth(), surface_height = I_GetSurfaceHeight();
+
+		const int xscale = V_TextScaleXAmount();
+		const int yscale = V_TextScaleYAmount();
+
+		const int line_height = 8 * yscale;
+
+		const int bottom = R_StatusBarVisible()
+			                   ? ST_StatusBarY(surface_width, surface_height) : surface_height;
+
+		const int x = surface_width / 2;
+		int y = (bottom / 2 - line_height * GameLines) / 2;
+
+		for (int i = 0; i < GameLines; i++, y += line_height)
+		{
+			screen->DrawTextStretched(GameColor,
+					x - xscale * (GameMsg[i].width / 2),
+					y, (byte*)GameMsg[i].string, xscale, yscale);
+		}
+
+		if (gametic >= GameTicker)
+		{
+			V_FreeBrokenLines(GameMsg);
+			GameMsg = NULL;
+		}
+	}
+}
+
+// denis - moved secret discovery message to this function
+EXTERN_CVAR(hud_revealsecrets)
+void C_RevealSecret()
+{
+	if(!hud_revealsecrets || !G_IsCoopGame() || !show_messages) // [ML] 09/4/06: Check for hud_revealsecrets
+		return;                      // NES - Also check for deathmatch
+
+	C_MidPrint("A secret is revealed!");
+
+	if (hud_revealsecrets == 1 || hud_revealsecrets == 3)
+		S_Sound(CHAN_INTERFACE, "misc/secret", 1, ATTN_NONE);
+}
+
+VERSION_CONTROL (c_console_cpp, "$Id: 9fb2bd1df7f53b2d8098968ca1d81f859ac0a917 $")

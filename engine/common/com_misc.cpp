@@ -1,0 +1,84 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 21c5fab4354d73b7af78a62690f1e5cd86c495d7 $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//   Common HUD functionality that can be called by the server as well.
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "com_misc.h"
+
+#include "c_dispatch.h"
+#include "m_random.h"
+#include "p_local.h"
+#include "v_textcolors.h"
+
+#if defined(SERVER_APP)
+#include "svc_message.h"
+#elif defined(CLIENT_APP)
+#include "st_stuff.h"
+#endif
+
+void COM_PushToast(const toast_t& toast)
+{
+#if defined(SERVER_APP)
+	for (auto& player : ::players)
+	{
+		MSG_WriteSVC(&player.client.reliablebuf, SVC_Toast(toast));
+	}
+#elif defined(CLIENT_APP)
+	hud::PushToast(toast);
+#endif
+}
+
+BEGIN_COMMAND(toast)
+{
+	toast_t toast;
+
+	toast.flags = toast_t::LEFT | toast_t::ICON | toast_t::RIGHT;
+
+	if (M_Random() % 2)
+	{
+		toast.left = std::string(TEXTCOLOR_LIGHTBLUE) + "[BLU]Ralphis";
+		toast.right = std::string(TEXTCOLOR_BRICK) + "[RED]KBlair";
+		if (M_Random() % 2)
+		{
+			toast.flags |= toast_t::SPREE;
+			toast.points = M_RandomInt(15);
+			toast.spree_color = M_RandomInt(NUM_TEXT_COLORS);
+		}
+	}
+	else
+	{
+		toast.left = std::string(TEXTCOLOR_BRICK) + "[RED]KBlair";
+		toast.right = std::string(TEXTCOLOR_LIGHTBLUE) + "[BLU]Ralphis";
+		if (M_Random() % 2)
+		{
+			toast.flags |= toast_t::SPREE;
+			toast.points = M_RandomInt(15);
+			toast.spree_color = M_RandomInt(NUM_TEXT_COLORS);
+		}
+	}
+
+	toast.icon = M_Random() % NUMMODS;
+
+	COM_PushToast(toast);
+}
+END_COMMAND(toast)

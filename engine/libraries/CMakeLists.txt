@@ -1,0 +1,178 @@
+# Build libraries.
+#
+# Here we use execute_process and file(DOWNLOAD) to download and compile
+# libraries as we need them.  Some stuff to remember:
+#
+# - C libraries can cross Debug/Release boundaries, but C++ libraries can't.
+#   You'll need to be able to select the proper debug vs release library in
+#   multi-config builds - see JsonCpp for an example.
+# - Xcode does not like it when CMake passes --parallel with no parameter.
+#
+
+# Parallel processor count - needed by Xcode.
+include(ProcessorCount)
+ProcessorCount(PARALLEL_PROC_COUNT)
+
+# Set our prefix path, so inter-dependencies are picked up on.
+if(CMAKE_PREFIX_PATH)
+  list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_BINARY_DIR}/local")
+else()
+  set(CMAKE_PREFIX_PATH "${CMAKE_CURRENT_BINARY_DIR}/local")
+endif()
+
+# Shorthand, to reduce line-noise
+set(libprefix "${CMAKE_STATIC_LIBRARY_PREFIX}")
+set(libsuffix "${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(dllprefix "${CMAKE_SHARED_LIBRARY_PREFIX}")
+set(dllsuffix "${CMAKE_SHARED_LIBRARY_SUFFIX}")
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/local/include")
+
+function(lib_buildgen)
+  cmake_parse_arguments("" "" "LIBRARY;SRCDIR;CXXFLAGS" "PARAMS" ${ARGN})
+
+  if(NOT _SRCDIR)
+    set(_SRCDIR "${CMAKE_CURRENT_SOURCE_DIR}/${_LIBRARY}")
+  endif()
+
+  # Baseline library generation.
+  set(_COMMAND "${CMAKE_COMMAND}"
+    -S "${_SRCDIR}"
+    -B "${CMAKE_CURRENT_BINARY_DIR}/${_LIBRARY}-build"
+    -G "${CMAKE_GENERATOR}"
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+    "-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}"
+    "-DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/local"
+    "-DCMAKE_INSTALL_LIBDIR=lib") # Without this, CentOS installs into lib64
+
+  if(EMSCRIPTEN)
+    # Sub-builds must cross-compile too.
+    list(APPEND _COMMAND "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+  endif()
+
+  if(CMAKE_GENERATOR_PLATFORM)
+    list(APPEND _COMMAND -A)
+    list(APPEND _COMMAND ${CMAKE_GENERATOR_PLATFORM})
+  endif()
+
+  if(CMAKE_GENERATOR_TOOLSET)
+    list(APPEND _COMMAND -T)
+    list(APPEND _COMMAND ${CMAKE_GENERATOR_TOOLSET})
+  endif()
+
+  if(CMAKE_C_COMPILER)
+    list(APPEND _COMMAND "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}")
+  endif()
+
+  if(CMAKE_CXX_COMPILER)
+    list(APPEND _COMMAND "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
+  endif()
+
+  if(CMAKE_LINKER)
+    list(APPEND _COMMAND "-DCMAKE_LINKER=${CMAKE_LINKER}")
+  endif()
+
+  if(CMAKE_RC_COMPILER)
+    list(APPEND _COMMAND "-DCMAKE_RC_COMPILER=${CMAKE_RC_COMPILER}")
+  endif()
+  if(CMAKE_OSX_ARCHITECTURES)
+    string(REPLACE ";" "\\;" _OSX_ARCHS "${CMAKE_OSX_ARCHITECTURES}")
+    list(APPEND _COMMAND "-DCMAKE_OSX_ARCHITECTURES=${_OSX_ARCHS}")
+  endif()
+  if(CMAKE_OSX_DEPLOYMENT_TARGET)
+    list(APPEND _COMMAND "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+  endif()
+
+  get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+  if(NOT _IS_MULTI_CONFIG)
+    list(APPEND _COMMAND "-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
+  endif()
+
+  if(_CXXFLAGS)
+    set(_ENVCMD ${CMAKE_COMMAND} -E env CXXFLAGS=${_CXXFLAGS})
+  endif()
+
+  message(STATUS "Generating ${_LIBRARY}...")
+  message(${_ENVCMD} ${_COMMAND} ${_PARAMS})
+  execute_process(COMMAND ${_ENVCMD} ${_COMMAND} ${_PARAMS} RESULT_VARIABLE _RESVAL)
+  if(_RESVAL GREATER 0)
+    message(FATAL_ERROR "Library ${_LIBRARY} did not generate correctly.")
+  endif()
+endfunction()
+
+function(lib_build)
+  cmake_parse_arguments("" "" "LIBRARY" "" ${ARGN})
+
+  # Compile the library.
+  get_property(_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+  if(_IS_MULTI_CONFIG)
+    # Debug and Release are not compatible, so build both.
+    message(STATUS "Building ${_LIBRARY} Debug...")
+    execute_process(COMMAND "${CMAKE_COMMAND}"
+      --build "${CMAKE_CURRENT_BINARY_DIR}/${_LIBRARY}-build"
+      --config Debug --target install
+      --parallel ${PARALLEL_PROC_COUNT} RESULT_VARIABLE _RESVAL)
+    if(_RESVAL GREATER 0)
+      message(FATAL_ERROR "Library ${_LIBRARY} did not build correctly as Debug.")
+    endif()
+
+    message(STATUS "Building ${_LIBRARY} RelWithDebInfo...")
+    execute_process(COMMAND "${CMAKE_COMMAND}"
+      --build "${CMAKE_CURRENT_BINARY_DIR}/${_LIBRARY}-build"
+      --config RelWithDebInfo --target install
+      --parallel ${PARALLEL_PROC_COUNT} RESULT_VARIABLE _RESVAL)
+    if(_RESVAL GREATER 0)
+      message(FATAL_ERROR "Library ${_LIBRARY} did not build correctly as Release.")
+    endif()
+  else()
+    # Single config uses the passed build type.
+    message(STATUS "Building ${_LIBRARY} ${CMAKE_BUILD_TYPE}...")
+    execute_process(COMMAND "${CMAKE_COMMAND}"
+      --build "${CMAKE_CURRENT_BINARY_DIR}/${_LIBRARY}-build"
+      --config ${CMAKE_BUILD_TYPE} --target install
+      --parallel ${PARALLEL_PROC_COUNT} RESULT_VARIABLE _RESVAL)
+    if(_RESVAL GREATER 0)
+      message(FATAL_ERROR "Library ${_LIBRARY} did not build correctly.")
+    endif()
+  endif()
+endfunction()
+
+### tiny libraries ###
+
+add_library(tinylibs INTERFACE)
+target_include_directories(tinylibs INTERFACE . "tinylibs/include")
+
+### minilzo ###
+
+message(STATUS "Compiling minilzo...")
+add_library(minilzo STATIC
+    "minilzo/lzoconf.h" "minilzo/lzodefs.h" "minilzo/minilzo.c" "minilzo/minilzo.h")
+target_include_directories(minilzo PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/minilzo")
+
+if(EMSCRIPTEN)
+  # The browser client takes SDL2, SDL2_mixer, zlib and libpng from
+  # Emscripten's ports, and goes without curl (WAD downloads).
+  function(odamex_emscripten_port _target _flag)
+    add_library(${_target} INTERFACE IMPORTED GLOBAL)
+    set_target_properties(${_target} PROPERTIES
+      INTERFACE_COMPILE_OPTIONS "${_flag}"
+      INTERFACE_LINK_OPTIONS "${_flag}")
+  endfunction()
+
+  odamex_emscripten_port(ZLIB::ZLIB "-sUSE_ZLIB=1")
+  odamex_emscripten_port(PNG::PNG "-sUSE_LIBPNG=1")
+  odamex_emscripten_port(SDL2::SDL2 "-sUSE_SDL=2")
+  odamex_emscripten_port(SDL2::mixer "-sUSE_SDL_MIXER=2")
+  add_library(curl_interface INTERFACE)
+else()
+  # The native server uses the system's zlib.
+  include(zlib-lib.cmake)
+endif()
+
+include(fmt-lib.cmake)
+
+include(jsoncpp-lib.cmake)
+
+include(protobuf-lib.cmake)
+
+include(libadlmidi-lib.cmake)

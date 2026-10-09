@@ -1,0 +1,4 @@
+# Build output (build.sh): intermediate files, and what it produces
+/build/
+/dist/
+

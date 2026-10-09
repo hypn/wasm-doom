@@ -1,0 +1,77 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 8bcc33b2bdcf3a779a24a93abc9e1825e274632b $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Refresh, visplane stuff (floor, ceilings).
+//
+//-----------------------------------------------------------------------------
+
+#pragma once
+
+#include "r_data.h"
+
+// Visplane related.
+extern	int*			lastopening;
+
+typedef void (*planefunction_t) (int top, int bottom);
+
+extern planefunction_t	floorfunc;
+extern planefunction_t	ceilingfunc_t;
+
+extern std::unique_ptr<int[]> floorclip;
+extern std::unique_ptr<int[]> ceilingclip;
+extern std::unique_ptr<int[]> floorclipinitial;
+extern std::unique_ptr<int[]> ceilingclipinitial;
+
+extern std::unique_ptr<fixed_t[]> yslope;
+
+void R_InitPlanes (void);
+void R_ClearPlanes (bool fullclear);
+
+void
+R_MapPlane
+( int		y,
+  int		x1,
+  int		x2 );
+
+void
+R_MakeSpans
+( int		x,
+  int		t1,
+  int		b1,
+  int		t2,
+  int		b2 );
+
+void R_DrawPlanes (void);
+void R_DrawPortals (void);
+
+visplane_t *R_FindPlane
+( const plane_t	&secplane,
+  int			picnum,
+  int			lightlevel,
+  fixed_t		xoffs,		// killough 2/28/98: add x-y offsets
+  fixed_t		yoffs,
+  fixed_t		xscale,
+  fixed_t		yscale,
+  angle_t		angle,
+  AActor::AActorPtr skybox);
+
+visplane_t *R_CheckPlane (visplane_t *pl, int start, int stop);
+
+// [RH] Added for multires support
+bool R_PlaneInitData(IWindowSurface* surface);

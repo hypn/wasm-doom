@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odamex Web</title>
+<link rel="stylesheet" href="odamex-web.css">
+</head>
+<body>
+<canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+
+<div class="overlay" id="loading">
+  <div class="panel">
+    <h1>Loading</h1>
+    <div class="bar"><div id="progress"></div></div>
+    <p id="status"></p>
+  </div>
+</div>
+
+<div class="overlay" id="error" hidden>
+  <div class="panel">
+    <h1>Error</h1>
+    <pre id="errortext"></pre>
+    <p><a href="" onclick="location.reload(); return false">Reload</a></p>
+  </div>
+</div>
+
+<script src="odamex.js"></script>
+<script src="odamex-web.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+
+  function fail(msg) {
+    $('errortext').textContent = String(msg);
+    $('loading').hidden = true;
+    $('error').hidden = false;
+    try { document.exitPointerLock(); } catch (e) {}
+  }
+
+  OdamexWeb.boot({
+    canvas: $('canvas'),
+    iwad: 'DOOM1.WAD',
+    onFatal: fail,
+    onStatus: function (text, fraction) {
+      $('status').textContent = text;
+      $('progress').style.width = (fraction * 100) + '%';
+      if (fraction >= 1) $('loading').hidden = true;
+    },
+  }).catch(function (e) { fail(e && e.stack || e); });
+})();
+</script>
+</body>
+</html>

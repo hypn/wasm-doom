@@ -1,0 +1,162 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 1ee6e6416a5cae731e9a98e6b7d8666a58e3e67e $
+//
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Command library (?)
+//
+//-----------------------------------------------------------------------------
+
+#pragma once
+
+#include <algorithm>
+#include <ctime>
+#include <optional>
+#include <charconv>
+
+#ifdef _MSC_VER
+#pragma warning(disable : 4244)     // MIPS
+#pragma warning(disable : 4136)     // X86
+#pragma warning(disable : 4051)     // ALPHA
+
+#pragma warning(disable : 4018)     // signed/unsigned mismatch
+#pragma warning(disable : 4305)     // truncate from double to float
+#endif
+
+
+#include <stdlib.h>
+#include <errno.h>
+#include <ctype.h>
+#include <stdarg.h>
+
+struct OTimespan
+{
+	int csecs;
+	int tics;
+	int seconds;
+	int minutes;
+	int hours;
+	OTimespan() : csecs(0), tics(0), seconds(0), minutes(0), hours(0) { }
+};
+
+int		ParseHex(const char *str);
+int 	ParseNum(const char *str);
+bool	IsNum(const char* str);		// [RH] added
+bool	IsNum(std::string_view str);
+bool	IsRealNum(const char* str);
+
+template<typename T>
+std::optional<T> ParseNum(std::string_view str, int base = 10)
+{
+    T out;
+	while (!str.empty() && std::isspace(static_cast<unsigned char>(str.front())))
+		str.remove_prefix(1);
+	if (str[0] == '$')
+	{
+		str.remove_prefix(1);
+		base = 16;
+	}
+    const std::from_chars_result result = std::from_chars(str.data(), str.data() + str.size(), out, base);
+    if (result.ec != std::errc())
+    {
+        return std::nullopt;
+    }
+    return out;
+}
+
+// [Russell] Returns 0 if strings are the same, optional parameter for case
+// sensitivity
+bool iequals(std::string_view, std::string_view);
+
+size_t  StdStringFind(const std::string& haystack, const std::string& needle,
+    size_t pos = 0, size_t n = std::string::npos, bool CIS = false);
+
+size_t  StdStringRFind(const std::string& haystack, const std::string& needle,
+    size_t pos = 0, size_t n = std::string::npos, bool CIS = false);
+
+std::string StdStringToLower(const std::string&, size_t n = std::string::npos);
+std::string StdStringToLower(const char*, size_t n = std::string::npos);
+std::string StdStringToUpper(const std::string&, size_t n = std::string::npos);
+std::string StdStringToUpper(const char*, size_t n = std::string::npos);
+
+std::string &TrimString(std::string &s);
+std::string &TrimStringStart(std::string &s);
+std::string &TrimStringEnd(std::string &s);
+std::string_view TrimStringView(std::string_view s);
+std::string_view TrimStringViewStart(std::string_view s);
+std::string_view TrimStringViewEnd(std::string_view s);
+
+bool ValidString(const std::string&);
+bool IsHexString(const std::string& str, const size_t len);
+
+char	*copystring(const char *s);
+bool M_StringCopy(char *dest, const char *src, size_t dest_size);
+
+std::vector<std::string> VectorArgs(size_t argc, char **argv);
+std::string JoinStrings(const std::vector<std::string> &pieces, const std::string &glue = "");
+
+typedef std::vector<std::string> StringTokens;
+StringTokens TokenizeString(const std::string& str, const std::string& delim);
+
+void StrFormatBytes(std::string& out, size_t bytes);
+bool StrFormatISOTime(std::string& s, const tm* utc_tm);
+bool StrParseISOTime(const std::string& s, tm* utc_tm);
+bool StrToTime(std::string str, time_t &tim);
+
+void TicsToTime(OTimespan& span, int time, bool ceilsec = false);
+
+bool CheckWildcards (const char *pattern, const char *text);
+void ReplaceString (char** ptr, const char* str);
+
+void StripColorCodes(std::string& str);
+
+double Remap(const double value, const double low1, const double high1, const double low2,
+             const double high2);
+uint32_t Log2(uint32_t n);
+
+/**
+ * @brief Initialize an array with a specific value.
+ *
+ * @tparam A Array type to initialize.
+ * @tparam T Value type to initialize with.
+ * @param dst Array to initialize.
+ * @param val Value to initialize with.
+ */
+template <typename A, typename T>
+static void ArrayInit(A& dst, const T& val)
+{
+	for (size_t i = 0; i < ARRAY_LENGTH(dst); i++)
+		dst[i] = val;
+}
+
+/**
+ * @brief Copy the complete contents of an array from one to the other.
+ *
+ * @detail Both params are templated in case the destination's type doesn't
+ *         line up 100% with the source.
+ *
+ * @tparam A1 Destination array type.
+ * @tparam A2 Source array type.
+ * @param dst Destination array to write to.
+ * @param src Source array to write from.
+ */
+template <typename A1, typename A2>
+static void ArrayCopy(A1& dst, const A2& src)
+{
+	for (size_t i = 0; i < ARRAY_LENGTH(src); i++)
+		dst[i] = src[i];
+}

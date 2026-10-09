@@ -1,0 +1,524 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: caec66a7dc59d786ba8c9b86ab8658e026d08778 $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	System specific interface stuff.
+//	[Odamex] Fitted to work with SDL
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include <limits>
+#include <string>
+
+#include "nonstd/scope.hpp"
+
+#include "i_sdl.h"
+#include <stdlib.h>
+
+#ifdef OSX
+	#include <mach/clock.h>
+	#include <mach/mach.h>
+	#include <Carbon/Carbon.h>
+	#include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#include "win32inc.h"
+#ifdef _WIN32
+	#include <direct.h>
+	#include <io.h>
+	#include <process.h>
+	#include <shlwapi.h>
+	#include <winsock2.h>
+	#include <mmsystem.h>
+	#include <shlobj.h>
+#endif // WIN32
+
+#ifdef UNIX
+// for getuid and geteuid
+	#include <unistd.h>
+	#include <sys/types.h>
+	#include <limits.h>
+	#include <time.h>
+	#include <pwd.h>
+#endif
+
+#include <sstream>
+
+#include <stdarg.h>
+#include <sys/types.h>
+
+#ifndef __OpenBSD__
+	#include <sys/timeb.h>
+#endif
+
+#include <sys/stat.h>
+
+
+#include "w_wad.h"
+#include "cmdlib.h"
+#include "m_argv.h"
+#include "m_misc.h"
+#include "i_video.h"
+#include "v_video.h"
+#include "i_sound.h"
+
+#include "d_main.h"
+#include "g_game.h"
+#include "i_system.h"
+#include "c_dispatch.h"
+#include "cl_main.h"
+#include "gi.h"
+#include "m_fileio.h"
+#include "txt_main.h"
+
+#ifndef GCONSOLE // I will add this back later -- Hyper_Eye
+	// For libtextscreen to link properly
+	extern "C"
+	{
+	#include "txt_main.h"
+	}
+	#define ENDOOM_W 80
+	#define ENDOOM_H 25
+#endif // GCONSOLE
+
+EXTERN_CVAR (r_loadicon)
+EXTERN_CVAR (r_showendoom)
+
+ticcmd_t emptycmd;
+ticcmd_t *I_BaseTiccmd(void)
+{
+	return &emptycmd;
+}
+
+uint32_t LanguageIDs[4];
+
+// Endoom screen is showing
+bool in_endoom = false;
+
+//
+// I_MegabytesToBytes
+//
+// Returns the megabyte value of size in bytes
+size_t I_MegabytesToBytes (size_t Megabytes)
+{
+	return (Megabytes*1024*1024);
+}
+
+//
+// I_BytesToMegabytes
+//
+// Returns the byte value of size in megabytes
+size_t I_BytesToMegabytes (size_t Bytes)
+{
+	if (!Bytes)
+        return 0;
+
+    return (Bytes/1024/1024);
+}
+
+void I_BeginRead()
+{
+	if (r_loadicon)
+		I_DrawLoadingIcon();
+}
+
+void I_EndRead(void)
+{
+}
+
+//
+// SubsetLanguageIDs
+//
+#if defined _WIN32
+static void SubsetLanguageIDs (LCID id, LCTYPE type, int idx)
+{
+	char buf[8];
+	LCID langid;
+	char *idp;
+
+	if (!GetLocaleInfo (id, type, buf, 8))
+		return;
+	langid = MAKELCID (strtoul(buf, NULL, 16), SORT_DEFAULT);
+	if (!GetLocaleInfo (langid, LOCALE_SABBREVLANGNAME, buf, 8))
+		return;
+	idp = (char *)(&LanguageIDs[idx]);
+	memset (idp, 0, 4);
+	idp[0] = tolower(buf[0]);
+	idp[1] = tolower(buf[1]);
+	idp[2] = tolower(buf[2]);
+	idp[3] = 0;
+}
+#endif
+
+EXTERN_CVAR(language)
+
+void SetLanguageIDs()
+{
+	const char* langid = language.cstring();
+
+	if (strcmp(langid, "auto") == 0)
+	{
+#if defined _WIN32
+		memset(LanguageIDs, 0, sizeof(LanguageIDs));
+		SubsetLanguageIDs(LOCALE_USER_DEFAULT, LOCALE_ILANGUAGE, 0);
+		SubsetLanguageIDs(LOCALE_USER_DEFAULT, LOCALE_IDEFAULTLANGUAGE, 1);
+		SubsetLanguageIDs(LOCALE_SYSTEM_DEFAULT, LOCALE_ILANGUAGE, 2);
+		SubsetLanguageIDs(LOCALE_SYSTEM_DEFAULT, LOCALE_IDEFAULTLANGUAGE, 3);
+#elif SDL_VERSION_ATLEAST(2, 0, 14)
+		SDL_Locale* locales = SDL_GetPreferredLocales();
+		size_t i;
+		for (i = 0; i < ARRAY_LENGTH(LanguageIDs) && locales && locales->language; i++)
+		{
+			char slang[4] = {'\0', '\0', '\0', '\0'};
+			strncpy(slang, locales->language, ARRAY_LENGTH(slang) - 1);
+			const uint32_t lang = MAKE_ID(slang[0], slang[1], slang[2], slang[3]);
+			LanguageIDs[i] = lang;
+		}
+		if (i < ARRAY_LENGTH(LanguageIDs))
+		{
+			// Fill the rest with the last valid entry
+			for (; i < ARRAY_LENGTH(LanguageIDs); i++)
+				LanguageIDs[i] = LanguageIDs[i - 1];
+		}
+#else
+		// Default to US English on non-windows systems
+		static constexpr uint32_t lang = MAKE_ID('e', 'n', 'u', '\0');
+		LanguageIDs[0] = lang;
+		LanguageIDs[1] = lang;
+		LanguageIDs[2] = lang;
+		LanguageIDs[3] = lang;
+#endif
+	}
+	else
+	{
+		char slang[4] = {'\0', '\0', '\0', '\0'};
+		strncpy(slang, langid, ARRAY_LENGTH(slang) - 1);
+		const uint32_t lang = MAKE_ID(slang[0], slang[1], slang[2], slang[3]);
+		LanguageIDs[0] = lang;
+		LanguageIDs[1] = lang;
+		LanguageIDs[2] = lang;
+		LanguageIDs[3] = lang;
+	}
+}
+
+//
+// I_Init
+//
+void I_Init()
+{
+	I_InitSound ();
+	I_InitHardware ();
+}
+
+void I_FinishClockCalibration()
+{
+}
+
+//
+// Displays the text mode ending screen after the game quits
+//
+
+void I_Endoom()
+{
+#ifndef GCONSOLE // I will return to this -- Hyper_Eye
+
+	if (!r_showendoom || Args.CheckParm ("-novideo"))
+		return;
+
+	int lump = -1;
+	int count = 0;
+	int y;
+	int indent;
+	while (count < 2 && (lump = W_FindLump("ENDOOM", lump)) != -1)
+	{
+		count++;
+	}
+
+	if (r_showendoom == 2 && count <= 1)
+		return;
+
+	// Hack to stop crash with disk icon
+	in_endoom = true;
+
+	unsigned char* endoom_data = (unsigned char*)W_CacheLumpName(gameinfo.endoom, PU_STATIC);
+
+	// Set up text mode screen
+
+	TXT_Init();
+
+	I_SetWindowCaption(D_GetTitleString());
+	I_SetWindowIcon();
+
+	// Write the data to the screen memory
+
+	unsigned char* screendata = TXT_GetScreenData();
+
+	if(NULL != screendata)
+	{
+		indent = (ENDOOM_W - TXT_SCREEN_W) / 2;
+
+		for (y=0; y<TXT_SCREEN_H; ++y)
+		{
+			memcpy(screendata + (y * TXT_SCREEN_W * 2),
+			endoom_data + (y * ENDOOM_W + indent) * 2,
+			TXT_SCREEN_W * 2);
+		}
+
+		// Wait for a keypress
+		while (true)
+		{
+			TXT_UpdateScreen();
+
+			if (TXT_GetChar() > 0)
+				break;
+
+			TXT_Sleep(0);
+		}
+	}
+
+	// Shut down text mode screen
+
+	TXT_Shutdown();
+
+	in_endoom = false;
+#endif // Hyper_Eye
+}
+
+//
+// I_Quit
+//
+static int has_exited;
+
+void I_Quit()
+{
+	has_exited = 1;		/* Prevent infinitely recursive exits -- killough */
+
+	G_ClearSnapshots ();
+
+	CL_QuitNetGame(NQ_SILENT);
+
+	M_SaveDefaults();
+
+	//I_ShutdownHardware();
+
+    CloseNetwork();
+
+	DConsoleAlias::DestroyAll();
+}
+
+
+//
+// I_Error
+//
+bool gameisdead;
+
+void call_terms();
+
+void I_BaseWarning(const std::string& warningtext)
+{
+	PrintFmt(PRINT_WARNING, "\n{}\n", warningtext);
+}
+
+[[noreturn]] void I_BaseError(const std::string& errortext)
+{
+	std::string messagetext;
+
+	if (!has_exited)
+	{
+		throw CRecoverableError(errortext);
+	}
+
+	// Recursive atterm, we've used up all our chances.
+	if (SDL_GetError()[0] != '\0')
+	{
+		messagetext = fmt::sprintf(
+		    "Error while shutting down, aborting:\n%s\nLast SDL Error:\n%s\n", errortext,
+		    SDL_GetError());
+	}
+	else
+	{
+		messagetext =
+		    fmt::sprintf("Error while shutting down, aborting:\n%s\n", errortext);
+	}
+
+	I_ErrorMessageBox(messagetext.c_str());
+
+	abort();
+}
+
+[[noreturn]] void I_BaseFatalError(const std::string& errortext)
+{
+	std::string messagetext;
+
+	static bool alreadyThrown = false;
+	gameisdead = true;
+
+	if (!alreadyThrown) // ignore all but the first message -- killough
+	{
+		alreadyThrown = true;
+		if (SDL_GetError()[0] != '\0')
+		{
+			messagetext =
+			    fmt::sprintf("%s\nLast SDL Error:\n%s\n", errortext, SDL_GetError());
+			SDL_ClearError();
+		}
+		else
+		{
+			messagetext = fmt::sprintf("%s\n", errortext);
+		}
+
+		throw CFatalError(messagetext);
+	}
+
+	if (!has_exited) // If it hasn't exited yet, exit now -- killough
+	{
+		has_exited = 1; // Prevent infinitely recursive exits -- killough
+
+		call_terms();
+
+		exit(EXIT_FAILURE);
+	}
+
+	// Recursive atterm, we've used up all our chances.
+	if (SDL_GetError()[0] != '\0')
+	{
+		messagetext = fmt::sprintf(
+		    "Error while shutting down, aborting:\n%s\nLast SDL Error:\n%s\n", errortext,
+		    SDL_GetError());
+	}
+	else
+	{
+		messagetext =
+		    fmt::sprintf("Error while shutting down, aborting:\n%s\n", errortext);
+	}
+
+	I_ErrorMessageBox(messagetext.c_str());
+
+	abort();
+}
+
+//
+// I_GetClipboardText
+//
+// by Denis Lukianov - 20 Mar 2006
+// Cross-platform clipboard functionality
+//
+// [EB] 20 Mar 2026 - Got rid of all platform specific code
+// Now that we dropped SDL1 support, we can fully rely on SDL for this
+//
+std::string I_GetClipboardText([[maybe_unused]] bool use_primary_selection)
+{
+#if defined(SDL20) || defined(SDL3)
+	#if SDL_VERSION_ATLEAST(2, 26, 0)
+		const auto driver = I_GetVideoDriverName();
+		const bool driver_supports_primary = driver == "wayland" || driver == "x11";
+		char* textp = use_primary_selection && driver_supports_primary ? SDL_GetPrimarySelectionText() : SDL_GetClipboardText();
+	#else
+		char* textp = SDL_GetClipboardText();
+	#endif
+	const auto textpExit = nonstd::make_scope_exit([&]() { SDL_free(textp); });
+
+	if (NULL == textp)
+	{
+		PrintFmt(PRINT_HIGH, "SDL_GetClipboardText error: {}", SDL_GetError());
+		return "";
+	}
+
+	std::string clipText(textp);
+
+	return clipText;
+#endif // SDL20
+
+	return "";
+}
+
+//
+// I_IsHeadless
+//
+// Returns true if no application window will be created.
+//
+bool I_IsHeadless()
+{
+	static bool headless;
+	static bool initialized = false;
+	if (!initialized)
+	{
+		headless = Args.CheckParm("-novideo") || Args.CheckParm("+demotest");
+		initialized = true;
+	}
+
+	return headless;
+}
+
+const char* ODAMEX_ERROR_TITLE = "Odamex " DOTVERSIONSTR " Fatal Error";
+
+#if defined(SDL20)
+
+void I_ErrorMessageBox(const char* message)
+{
+	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, ODAMEX_ERROR_TITLE, message, NULL);
+}
+
+#elif defined(WIN32)
+
+void I_ErrorMessageBox(const char* message)
+{
+	MessageBoxA(NULL, message, ODAMEX_ERROR_TITLE, MB_OK);
+}
+
+#elif OSX
+
+void I_ErrorMessageBox(const char* message)
+{
+	CFStringRef macErrorMessage =
+	    CFStringCreateWithCString(NULL, message, kCFStringEncodingMacRoman);
+	CFUserNotificationDisplayAlert(0, 0, NULL, NULL, NULL, CFSTR(ODAMEX_ERROR_TITLE),
+	                               macErrorMessage, CFSTR("OK"), NULL, NULL, NULL);
+	CFRelease(macErrorMessage);
+}
+
+#else
+
+void I_ErrorMessageBox(const char* message)
+{
+	fmt::print(stderr, "{}\n{}\n", ODAMEX_ERROR_TITLE, message);
+}
+
+#endif
+
+#if defined(ODAMEX_DEBUG)
+
+BEGIN_COMMAND(debug_userfilename)
+{
+	if (argc < 2)
+	{
+		PrintFmt("debug_userfilename: needs a path to check.\n");
+		return;
+	}
+
+	std::string userfile = M_GetUserFileName(argv[1]);
+	PrintFmt("Resolved to: {:s}\n", userfile);
+}
+END_COMMAND(debug_userfilename)
+
+#endif
+
+VERSION_CONTROL (i_system_cpp, "$Id: caec66a7dc59d786ba8c9b86ab8658e026d08778 $")

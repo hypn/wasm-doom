@@ -1,0 +1,92 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: c50a7fbc0985e92c795c4e02b193fb7876a52cac $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Rendering of moving objects, sprites.
+//
+//-----------------------------------------------------------------------------
+
+
+#pragma once
+
+#include "r_sprites.h"
+
+// [RH] Particle details
+// Expanded to be able to use patches/textures for particle effects
+struct particle_s {
+	fixed_t	x,y,z;
+	fixed_t velx,vely,velz;
+	fixed_t accx,accy,accz;
+	int		sprite; // new
+	byte	ttl;
+	byte	trans;
+	byte	size;
+	byte	fade;
+	int		color;
+	uint16_t next;
+	uint16_t nextinsubsector;
+};
+typedef struct particle_s particle_t;
+
+extern int	NumParticles;
+extern int	ActiveParticles;
+extern int	InactiveParticles;
+extern particle_t *Particles;
+extern std::vector<uint16_t> ParticlesInSubsec;
+
+inline constexpr uint16_t NO_PARTICLE = 0xffff;
+
+inline particle_t *NewParticle()
+{
+	particle_t *result = nullptr;
+	if (clientside && InactiveParticles != NO_PARTICLE) {
+		result = Particles + InactiveParticles;
+		InactiveParticles = result->next;
+		result->next = ActiveParticles;
+		ActiveParticles = result - Particles;
+	}
+	return result;
+}
+void R_InitParticles ();
+void R_ClearParticles ();
+void R_DrawParticle(vissprite_t*);
+void R_ProjectParticle (particle_t *, const sector_t* sector, int fakeside);
+void R_FindParticleSubsectors();
+
+extern int MaxVisSprites;
+
+extern vissprite_t		*vissprites;
+extern vissprite_t* 	vissprite_p;
+extern vissprite_t		vsprsortedhead;
+
+// vars for R_DrawMaskedColumn
+extern int*			mfloorclip;
+extern int*			mceilingclip;
+extern fixed_t		spryscale;
+extern fixed_t		sprtopscreen;
+
+extern fixed_t		pspritexscale;
+extern fixed_t		pspriteyscale;
+extern fixed_t		pspritexiscale;
+
+void R_SortVisSprites();
+void R_AddSprites(sector_t *sec, int lightlevel, int fakeside);
+void R_ClearSprites();
+void R_DrawMasked();
+fixed_t P_CalculateWeaponBobX(player_t& player, float scale_amount);
+fixed_t P_CalculateWeaponBobY(player_t& player, float scale_amount);

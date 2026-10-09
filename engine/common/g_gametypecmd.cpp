@@ -1,0 +1,528 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 5a26b8fb08a5e3377b0a348ad16ef3f9fc0f3548 $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//   Built-in gametype commands.
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "c_dispatch.h"
+#include "cmdlib.h"
+#include "hashtable.h"
+
+typedef std::vector<std::string> StringList;
+
+struct GametypeParam
+{
+	const char* cvar;
+	const int def;
+	const char* flag;
+	const char* flagparam;
+	const char* help;
+};
+
+/**
+ * @brief Generate flag help for gametype functions.
+ *
+ * @param params Array of parameters to examine.
+ */
+template <size_t SIZE> static void GametypeHelp(const GametypeParam (&params)[SIZE])
+{
+	PrintFmt("Flags:\n");
+	PrintFmt("  default\n");
+	PrintFmt("    Use default settings.\n");
+	for (size_t i = 0; i < SIZE; i++)
+	{
+		PrintFmt("  {} <{}>\n", params[i].flag, params[i].flagparam);
+		PrintFmt("    {}\n", params[i].help);
+	}
+}
+
+/**
+ * @brief Parse arguments for a gametype.
+ *
+ * @param params Gametype arguments.
+ * @param argc Argument count.
+ * @param argv Arguments pointer.
+ * @return List of console commands to execute.
+ */
+template <size_t SIZE>
+static StringList GametypeArgs(const GametypeParam (&params)[SIZE], size_t argc,
+                               char** argv)
+{
+	StringList ret;
+
+	// Insert defaults into a hashtable.
+	typedef OHashTable<std::string, int> CvarTable;
+	CvarTable cvars;
+	for (size_t i = 0; i < SIZE; i++)
+	{
+		cvars.insert(std::make_pair(params[i].cvar, params[i].def));
+	}
+
+	StringList args = VectorArgs(argc, argv);
+	if (!(!args.empty() && iequals(args.at(0), "default")))
+	{
+		for (;;)
+		{
+			if (args.empty())
+			{
+				// Ran out of parameters to munch.
+				break;
+			}
+			else if (args.size() == 1)
+			{
+				// All params take a second one.
+				PrintFmt(PRINT_HIGH, "Missing argument for \"{}\"\n", args.front());
+				return ret;
+			}
+
+			const std::string& cmd = args.at(0);
+			const int val = atoi(args.at(1).c_str());
+
+			bool next = false;
+			for (size_t i = 0; i < SIZE; i++)
+			{
+				if (iequals(cmd, params[i].flag))
+				{
+					// Set a new value.
+					cvars.insert(std::make_pair(std::string(params[i].cvar), val));
+
+					// Shift param and argument off the front.
+					args.erase(args.begin(), args.begin() + 2);
+
+					// Next flag.
+					next = true;
+					break;
+				}
+			}
+
+			if (next)
+			{
+				// Next flag.
+				continue;
+			}
+
+			// Unknown flag.
+			PrintFmt(PRINT_HIGH, "Unknown flag \"{}\"\n", cmd);
+			return ret;
+		}
+	}
+
+	// Apply all the flags
+	for (const auto& [cvar, def] : cvars)
+	{
+		ret.push_back(fmt::format("{} {}", cvar, def));
+	}
+
+	// We're done!
+	return ret;
+}
+
+/*
+ * Actual commands start below.
+ */
+
+static GametypeParam coopParams[] = {
+    {"sv_skill", 4, "skill", "SKILL",
+     "Set the skill of the game to SKILL.  Defaults to 4."}};
+
+static void CoopHelp()
+{
+	PrintFmt("game_coop - Configures some settings for a basic Cooperative game\n");
+	GametypeHelp(::coopParams);
+}
+
+BEGIN_COMMAND(game_coop)
+{
+	if (argc < 2)
+	{
+		CoopHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::coopParams, argc, argv);
+	if (params.empty())
+	{
+		CoopHelp();
+		return;
+	}
+
+	params.push_back("g_lives 0");
+	params.push_back("g_lives_jointimer 30");
+	params.push_back("g_rounds 0");
+	params.push_back("sv_forcerespawn 0");
+	params.push_back("sv_gametype 0");
+	params.push_back("sv_nomonsters 0");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Cooperative...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_coop)
+
+static GametypeParam survivalParams[] = {
+    {"g_lives", 3, "lives", "LIVES",
+     "Set number of player lives to LIVES.  Defaults to 3."},
+    {"sv_skill", 4, "skill", "SKILL",
+     "Set the skill of the game to SKILL.  Defaults to 4."}};
+
+static void SurvivalHelp()
+{
+	PrintFmt("game_survival - Configures some settings for a basic game of Survival\n");
+	GametypeHelp(::survivalParams);
+}
+
+BEGIN_COMMAND(game_survival)
+{
+	if (argc < 2)
+	{
+		SurvivalHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::survivalParams, argc, argv);
+	if (params.empty())
+	{
+		SurvivalHelp();
+		return;
+	}
+
+	params.push_back("g_lives_jointimer 30");
+	params.push_back("g_rounds 0");
+	params.push_back("sv_forcerespawn 1");
+	params.push_back("sv_gametype 0");
+	params.push_back("sv_nomonsters 0");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Survival...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_survival)
+
+static GametypeParam dmParams[] = {
+    {"sv_fraglimit", 30, "frags", "FRAGLIMIT",
+     "Set number of frags needed to win to FRAGLIMIT.  Defaults to 30."},
+    {"sv_timelimit", 10, "time", "TIMELIMIT",
+     "Set number of minutes until the match ends to TIMELIMIT.  Defaults to 10."}};
+
+static void DMHelp()
+{
+	PrintFmt("game_dm - Configures some settings for a basic game of Deathmatch\n");
+	GametypeHelp(::dmParams);
+}
+
+BEGIN_COMMAND(game_dm)
+{
+	if (argc < 2)
+	{
+		DMHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::dmParams, argc, argv);
+	if (params.empty())
+	{
+		DMHelp();
+		return;
+	}
+
+	params.push_back("g_lives 0");
+	params.push_back("g_rounds 0");
+	params.push_back("sv_forcerespawn 0");
+	params.push_back("sv_gametype 1");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Deathmatch...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_dm)
+
+static GametypeParam duelParams[] = {
+    {"sv_fraglimit", 50, "frags", "FRAGLIMIT",
+     "Set number of frags needed to win to FRAGLIMIT.  Defaults to 50."}};
+
+static void DuelHelp()
+{
+	PrintFmt("game_duel - Configures some settings for a basic Duel\n");
+	GametypeHelp(::duelParams);
+}
+
+BEGIN_COMMAND(game_duel)
+{
+	if (argc < 2)
+	{
+		DuelHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::dmParams, argc, argv);
+	if (params.empty())
+	{
+		DuelHelp();
+		return;
+	}
+
+	params.push_back("g_lives 0");
+	params.push_back("g_rounds 0");
+	params.push_back("g_winnerstays 1");
+	params.push_back("sv_forcerespawn 1");
+	params.push_back("sv_forcerespawntime 10");
+	params.push_back("sv_gametype 1");
+	params.push_back("sv_maxplayers 2");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+	params.push_back("sv_warmup 1");
+	params.push_back("sv_warmup_autostart 1.0");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Duel...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_duel)
+
+static GametypeParam lmsParams[] = {
+    {"g_lives", 1, "lives", "LIVES",
+     "Set number of player lives per round to LIVES.  Defaults to 1."},
+    {"g_winlimit", 5, "wins", "WINS",
+     "Set number of round wins needed to win the game to WINS.  Defaults to 5."}};
+
+static void LMSHelp()
+{
+	PrintFmt(
+	    "game_lms - Configures some settings for a basic game of Last Marine Standing\n");
+	GametypeHelp(::lmsParams);
+}
+
+BEGIN_COMMAND(game_lms)
+{
+	if (argc < 2)
+	{
+		LMSHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::lmsParams, argc, argv);
+	if (params.empty())
+	{
+		LMSHelp();
+		return;
+	}
+
+	params.push_back("g_lives_jointimer 0");
+	params.push_back("g_rounds 1");
+	params.push_back("sv_forcerespawn 1");
+	params.push_back("sv_gametype 1");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Last Marine Standing...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_lms)
+
+static GametypeParam tdmParams[] = {
+    {"sv_fraglimit", 50, "frags", "FRAGLIMIT",
+     "Set number of frags needed to win to FRAGLIMIT.  Defaults to 30."},
+    {"sv_timelimit", 10, "time", "TIMELIMIT",
+     "Set number of minutes until the match ends to TIMELIMIT.  Defaults to 10."}};
+
+static void TDMHelp()
+{
+	PrintFmt("game_tdm - Configures some settings for a basic game of Team Deathmatch\n");
+	GametypeHelp(::tdmParams);
+}
+
+BEGIN_COMMAND(game_tdm)
+{
+	if (argc < 2)
+	{
+		TDMHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::tdmParams, argc, argv);
+	if (params.empty())
+	{
+		TDMHelp();
+		return;
+	}
+
+	params.push_back("g_lives 0");
+	params.push_back("g_rounds 0");
+	params.push_back("sv_forcerespawn 0");
+	params.push_back("sv_friendlyfire 0");
+	params.push_back("sv_gametype 2");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Team Deathmatch...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_tdm)
+
+static GametypeParam tlmsParams[] = {
+    {"g_lives", 1, "lives", "LIVES",
+     "Set number of player lives per round to LIVES.  Defaults to 1."},
+    {"sv_teamsinplay", 2, "teams", "TEAMS",
+     "Set number of teams in play to TEAMS.  Defaults to 2."},
+    {"g_winlimit", 5, "wins", "WINS",
+     "Set number of round wins needed to win the game to WINS.  Defaults to 5."}};
+
+static void TLMSHelp()
+{
+	PrintFmt("game_tlms - Configures some settings for a basic game of Team Last Marine "
+	         "Standing\n");
+	GametypeHelp(::tlmsParams);
+}
+
+BEGIN_COMMAND(game_tlms)
+{
+	if (argc < 2)
+	{
+		TLMSHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::tlmsParams, argc, argv);
+	if (params.empty())
+	{
+		TLMSHelp();
+		return;
+	}
+
+	params.push_back("g_lives_jointimer 0");
+	params.push_back("g_rounds 1");
+	params.push_back("sv_forcerespawn 1");
+	params.push_back("sv_friendlyfire 0");
+	params.push_back("sv_gametype 2");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Team Last Marine Standing...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_tlms)
+
+static GametypeParam ctfParams[] = {
+    {"sv_scorelimit", 5, "score", "SCORELIMIT",
+     "Set number of scores needed to win to SCORELIMIT.  Defaults to 5."},
+    {"sv_teamsinplay", 2, "teams", "TEAMS",
+     "Set number of teams in play to TEAMS.  Defaults to 2."},
+    {"sv_timelimit", 10, "time", "TIMELIMIT",
+     "Set number of minutes until the match ends to TIMELIMIT.  Defaults to 10."}};
+
+static void CTFHelp()
+{
+	PrintFmt("game_ctf - Configures some settings for a basic game of Capture the Flag\n");
+	GametypeHelp(::ctfParams);
+}
+
+BEGIN_COMMAND(game_ctf)
+{
+	if (argc < 2)
+	{
+		CTFHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::ctfParams, argc, argv);
+	if (params.empty())
+	{
+		CTFHelp();
+		return;
+	}
+
+	params.push_back("g_lives 0");
+	params.push_back("g_rounds 0");
+	params.push_back("sv_forcerespawn 0");
+	params.push_back("sv_friendlyfire 0");
+	params.push_back("sv_gametype 3");
+	params.push_back("sv_nomonsters 1");
+	params.push_back("sv_skill 5");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Capture the Flag...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_ctf)
+
+static GametypeParam hordeParams[] = {
+    {"sv_skill", 4, "skill", "SKILL",
+     "Set the skill of the game to SKILL.  Defaults to 4."},
+    {"g_lives", 1, "lives", "LIVES",
+     "Set number of scores needed to win to LIVES.  Defaults to 5."},
+    {"g_roundlimit", 2, "rounds", "ROUNDS",
+     "Set number of second-chance rounds there are to ROUNDS.  Defaults to 2."}};
+
+static void HordeHelp()
+{
+	PrintFmt("game_horde - Configures some settings for a basic game of Horde\n");
+	GametypeHelp(::hordeParams);
+}
+
+BEGIN_COMMAND(game_horde)
+{
+	if (argc < 2)
+	{
+		HordeHelp();
+		return;
+	}
+
+	std::string buffer;
+	StringList params = GametypeArgs(::hordeParams, argc, argv);
+	if (params.empty())
+	{
+		HordeHelp();
+		return;
+	}
+
+	if (std::find(params.begin(), params.end(), "g_roundlimit 0") == params.end())
+	{
+		params.push_back("g_rounds 1");
+	}
+	else
+	{
+		params.push_back("g_rounds 0");
+	}
+
+	params.push_back("sv_forcerespawn 0");
+	params.push_back("sv_friendlyfire 0");
+	params.push_back("sv_gametype 4");
+	params.push_back("sv_nomonsters 0");
+
+	std::string config = JoinStrings(params, "; ");
+	PrintFmt("Configuring Horde...\n{}\n", config);
+	AddCommandString(config);
+}
+END_COMMAND(game_horde)

@@ -1,0 +1,2179 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 0553493482dffa8966e4fa137f9d6e57b737ed5e $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	G_GAME
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "minilzo.h"
+#include "m_alloc.h"
+#include "z_zone.h"
+#include "f_finale.h"
+#include "m_argv.h"
+#include "m_fileio.h"
+#include "m_menu.h"
+#include "m_random.h"
+#include "i_system.h"
+#include "i_input.h"
+#include "i_time.h"
+#include "i_video.h"
+#include "v_screenshot.h"
+#include "p_saveg.h"
+#include "p_tick.h"
+#include "d_main.h"
+#include "wi_stuff.h"
+#include "hu_stuff.h"
+#include "st_stuff.h"
+#include "am_map.h"
+#include "c_console.h"
+#include "c_bind.h"
+#include "c_dispatch.h"
+#include "v_video.h"
+#include "w_wad.h"
+#include "p_local.h"
+#include "s_sound.h"
+#include "s_sndseq.h"
+#include "gstrings.h"
+#include "r_sky.h"
+#include "r_draw.h"
+#include "r_interp.h"
+#include "g_game.h"
+#include "cl_main.h"
+#include "cl_demo.h"
+#include "cl_replay.h"
+#include "gi.h"
+#include "hu_mousegraph.h"
+#include "g_spawninv.h"
+#include "g_gametype.h"
+#include "p_horde.h"
+#include "g_musinfo.h"
+#include "g_spree.h"
+#include "g_multikill.h"
+#include "cl_freecam.h"
+
+#include <math.h> // for pow()
+
+#define SAVESTRINGSIZE	24
+
+#define TURN180_TICKS	9				// [RH] # of ticks to complete a turn180
+
+bool	G_CheckDemoStatus (void);
+void	G_ReadDemoTiccmd ();
+void	G_WriteDemoTiccmd ();
+void	G_PlayerReborn (player_t &player);
+
+void	G_DoNewGame (void);
+void	G_DoLoadGame (void);
+void	G_DoCompleted (void);
+void	G_DoWorldDone (void);
+void	G_DoSaveGame();
+
+bool	C_DoNetDemoKey(event_t *ev);
+bool	C_DoSpectatorKey(event_t *ev);
+
+void	CL_QuitCommand();
+
+fixed_t P_TickWeaponBobX();
+fixed_t P_TickWeaponBobY();
+
+EXTERN_CVAR (sv_skill)
+EXTERN_CVAR (novert)
+EXTERN_CVAR (sv_monstersrespawn)
+EXTERN_CVAR (sv_itemsrespawn)
+EXTERN_CVAR (sv_respawnsuper)
+EXTERN_CVAR (sv_respawnbarrels)
+EXTERN_CVAR (sv_weaponstay)
+EXTERN_CVAR (sv_keepkeys)
+EXTERN_CVAR (sv_sharekeys)
+EXTERN_CVAR (co_nosilentspawns)
+EXTERN_CVAR (in_autosr50)
+
+EXTERN_CVAR (chasedemo)
+
+gamestate_t 	gamestate = GS_STARTUP;
+
+bool 			sendpause;				// send a pause event next tic
+bool			sendsave;				// send a save event next tic
+bool 			usergame;				// ok to save / end game
+bool			sendcenterview;			// send a center view event next tic
+
+bool			longtics;				// don't quantize yaw for classic vanilla demos
+bool 			nodrawers;				// for comparative timing purposes
+bool 			noblit; 				// for comparative timing purposes
+
+int 			gametic;
+
+extern fixed_t bobx;
+extern fixed_t boby;
+
+enum demoversion_t
+{
+	LMP_DOOM_1_9,
+	LMP_DOOM_1_9_1, // longtics hack
+}demoversion;
+
+#define DOOM_1_4_DEMO		0x68
+#define DOOM_1_5_DEMO		0x69
+#define DOOM_1_6_DEMO		0x6A
+#define DOOM_1_7_DEMO		0x6B
+#define DOOM_1_8_DEMO		0x6C
+#define DOOM_1_9_DEMO		0x6D
+#define DOOM_1_9p_DEMO		0x6E
+#define DOOM_1_9_1_DEMO		0x6F
+
+EXTERN_CVAR(sv_nomonsters)
+EXTERN_CVAR(sv_fastmonsters)
+EXTERN_CVAR(sv_freelook)
+EXTERN_CVAR(sv_allowjump)
+EXTERN_CVAR(sv_showplayerpowerups)
+EXTERN_CVAR(co_zdoomphys)
+EXTERN_CVAR(co_fixweaponimpacts)
+EXTERN_CVAR(co_blockmapfix)
+EXTERN_CVAR (cl_run)
+EXTERN_CVAR (hud_mousegraph)
+EXTERN_CVAR (cl_predictpickup)
+
+EXTERN_CVAR (mouse_sensitivity)
+EXTERN_CVAR (m_pitch)
+EXTERN_CVAR (m_filter)
+EXTERN_CVAR (invertmouse)
+EXTERN_CVAR (lookstrafe)
+EXTERN_CVAR (m_yaw)
+EXTERN_CVAR (m_forward)
+EXTERN_CVAR (m_side)
+
+
+CVAR_FUNC_IMPL(mouse_type)
+{
+	// Convert vanilla Doom mouse sensitivity settings to ZDoom mouse sensitivity
+	if (var.asInt() == MOUSE_DOOM)
+	{
+		mouse_sensitivity.Set((mouse_sensitivity + 5.0f) / 40.0f);
+		m_pitch.Set(m_pitch * 4.0f);
+	}
+	if (var.asInt() != MOUSE_ZDOOM_DI)
+		var.Set(MOUSE_ZDOOM_DI);
+}
+
+
+CVAR_FUNC_IMPL(cl_mouselook)
+{
+	// Nes - center the view
+	AddCommandString("centerview");
+
+	// Nes - update skies
+	R_InitSkyMap ();
+}
+
+CVAR_FUNC_IMPL(joy_freelook)
+{
+	// [RV] - Center view, Update Skies
+	AddCommandString("centerview");
+	R_InitSkyMap();
+}
+
+char			demoname[256];
+
+extern bool		simulated_connection;
+
+int				iffdemover;
+byte*			demobuffer;
+byte			*demo_p, *demo_e;
+bool 			singledemo; 			// quit after playing a demo from cmdline
+int				demostartgametic;
+FILE*			recorddemo_fp;
+
+bool 			precache = true;		// if true, load all graphics at start
+
+wbstartstruct_t wminfo; 				// parms for world map / intermission
+
+#define MAXPLMOVE				(forwardmove[1])
+
+#define TURBOTHRESHOLD	12800
+
+fixed_t	 		forwardmove[2] = {0x19, 0x32};
+fixed_t	 		sidemove[2] = {0x18, 0x28};
+
+fixed_t 		angleturn[3] = {640, 1280, 320};		// + slow turn
+fixed_t			flyspeed[2] = {1*256, 3*256};
+int				lookspeed[2] = {450, 512};
+
+#define SLOWTURNTICS	6
+
+int 			turnheld;								// for accelerative turning
+
+// mouse values are used once
+int 			mousex;
+int 			mousey;
+
+// [Toke - Mouse] new mouse stuff
+int	mousexleft;
+int	mouseydown;
+
+// Joystick values are repeated
+// Store a value for each of the analog axis controls -- Hyper_Eye
+int				joyforward;
+int				joystrafe;
+int				joyturn;
+int				joylook;
+
+EXTERN_CVAR (joy_forwardaxis)
+EXTERN_CVAR (joy_strafeaxis)
+EXTERN_CVAR (joy_turnaxis)
+EXTERN_CVAR (joy_lookaxis)
+EXTERN_CVAR (joy_sensitivity)
+EXTERN_CVAR (joy_fastsensitivity)
+EXTERN_CVAR (joy_invert)
+EXTERN_CVAR (joy_freelook)
+
+int 			savegameslot;
+std::string		savedescription;
+
+player_t		&consoleplayer()
+{
+	return idplayer(consoleplayer_id);
+}
+
+player_t		&displayplayer()
+{
+	return idplayer(displayplayer_id);
+}
+
+player_t		&listenplayer()
+{
+	return displayplayer();
+}
+
+// [RH] Name of screenshot file to generate (usually NULL)
+std::string		shotfile;
+
+/* [RH] Impulses: Temporary hack to get weapon changing
+ * working with keybindings until I can get the
+ * inventory system working.
+ *
+ *	So this turned out to not be so temporary. It *will*
+ * change, though.
+ */
+int Impulse;
+
+BEGIN_COMMAND (impulse)
+{
+	if (argc > 1)
+		Impulse = atoi (argv[1]);
+}
+END_COMMAND (impulse)
+
+BEGIN_COMMAND (centerview)
+{
+	sendcenterview = true;
+}
+END_COMMAND (centerview)
+
+BEGIN_COMMAND (pause)
+{
+	sendpause = true;
+}
+END_COMMAND (pause)
+
+BEGIN_COMMAND (turnspeeds)
+{
+	if (argc == 1)
+	{
+		PrintFmt(PRINT_HIGH, "Current turn speeds: {} {} {}\n",
+				 angleturn[0], angleturn[1], angleturn[2]);
+	}
+	else
+	{
+		size_t i;
+		for (i = 1; i <= 3 && i < argc; i++)
+			angleturn[i-1] = atoi (argv[i]);
+
+		if (i <= 2)
+			angleturn[1] = angleturn[0] * 2;
+		if (i <= 3)
+			angleturn[2] = angleturn[0] / 2;
+	}
+}
+END_COMMAND (turnspeeds)
+
+static int turntick;
+BEGIN_COMMAND (turn180)
+{
+	turntick = TURN180_TICKS;
+}
+END_COMMAND (turn180)
+
+weapontype_t P_GetNextWeapon(player_t *player, bool forward);
+BEGIN_COMMAND (weapnext)
+{
+	weapontype_t newweapon = P_GetNextWeapon(&consoleplayer(), true);
+	if (newweapon != wp_nochange)
+		Impulse = int(newweapon) + 50;
+}
+END_COMMAND (weapnext)
+
+BEGIN_COMMAND (weapprev)
+{
+	weapontype_t newweapon = P_GetNextWeapon(&consoleplayer(), false);
+	if (newweapon != wp_nochange)
+		Impulse = int(newweapon) + 50;
+}
+END_COMMAND (weapprev)
+
+BEGIN_COMMAND (togglerun)
+{
+	cl_run.Set(!cl_run.value());
+
+	PrintFmt(PRINT_HIGH, "Always run {}\n",
+			 cl_run.value() ? "on" : "off");
+}
+END_COMMAND (togglerun)
+
+extern constate_e ConsoleState;
+
+//
+// G_BuildTiccmd
+// Builds a ticcmd from all of the available inputs
+// or reads it from the demo buffer.
+// If recording a demo, write it out
+//
+void G_BuildTiccmd(ticcmd_t *cmd)
+{
+	::localview.skipangle = false;
+	::localview.skippitch = false;
+
+	ticcmd_t* base = I_BaseTiccmd();	// empty or external driver
+	memcpy(cmd, base, sizeof(*cmd));
+
+	int strafe = Actions[ACTION_STRAFE];
+	int speed = Actions[ACTION_SPEED];
+	if (cl_run)
+		speed ^= 1;
+
+	int forward = 0, side = 0, look = 0, fly = 0;
+
+	if ((&consoleplayer())->spectator && Actions[ACTION_USE] && connected)
+		AddCommandString("join");
+
+	// [RH] only use two stage accelerative turning on the keyboard
+	//		and not the joystick, since we treat the joystick as
+	//		the analog device it is.
+	if ((Actions[ACTION_LEFT]) || (Actions[ACTION_RIGHT]))
+		turnheld += 1;
+	else
+		turnheld = 0;
+
+	int tspeed = speed;
+	if (turnheld < SLOWTURNTICS)
+		tspeed = 2; 			// slow turn
+
+	// let movement keys cancel each other out
+	if (strafe)
+	{
+		if (Actions[ACTION_RIGHT] || Actions[ACTION_LEFT])
+		{
+			if (Actions[ACTION_RIGHT])
+				side += sidemove[speed];
+			if (Actions[ACTION_LEFT])
+				side -= sidemove[speed];
+		}
+		else if (in_autosr50)
+		{
+			if (Actions[ACTION_MOVERIGHT])
+				side += sidemove[speed];
+			if (Actions[ACTION_MOVELEFT])
+				side -= sidemove[speed];
+		}
+	}
+	else
+	{
+		if (Actions[ACTION_RIGHT])
+		{
+			if (::angleturn[tspeed] != 0)
+			{
+				cmd->yaw -= ::angleturn[tspeed];
+				::localview.skipangle = true;
+			}
+		}
+		if (Actions[ACTION_LEFT])
+		{
+			if (::angleturn[tspeed] != 0)
+			{
+				cmd->yaw += ::angleturn[tspeed];
+				::localview.skipangle = true;
+			}
+		}
+	}
+
+	// Joystick analog strafing -- Hyper_Eye
+	side += (int)(((float)joystrafe / (float)SHRT_MAX) * sidemove[speed]);
+
+	if (Actions[ACTION_LOOKUP])
+	{
+		look += lookspeed[speed];
+		::localview.skippitch = true;
+	}
+	if (Actions[ACTION_LOOKDOWN])
+	{
+		look -= lookspeed[speed];
+		::localview.skippitch = true;
+	}
+
+	if (Actions[ACTION_MOVEUP])
+		fly += flyspeed[speed];
+	if (Actions[ACTION_MOVEDOWN])
+		fly -= flyspeed[speed];
+
+	if (Actions[ACTION_KLOOK])
+	{
+		if (Actions[ACTION_FORWARD])
+		{
+			look += lookspeed[speed];
+			::localview.skippitch = true;
+		}
+		if (Actions[ACTION_BACK])
+		{
+			look -= lookspeed[speed];
+			::localview.skippitch = true;
+		}
+	}
+	else
+	{
+		if (Actions[ACTION_FORWARD])
+			forward += forwardmove[speed];
+		if (Actions[ACTION_BACK])
+			forward -= forwardmove[speed];
+	}
+
+	// Joystick analog look -- Hyper_Eye
+	if ((joy_freelook && sv_freelook) || consoleplayer().spectator)
+	{
+		if (joy_invert)
+			look += (int)(((float)joylook / (float)SHRT_MAX) * lookspeed[speed]);
+		else
+			look -= (int)(((float)joylook / (float)SHRT_MAX) * lookspeed[speed]);
+
+		::localview.skippitch = true;
+	}
+
+	if (Actions[ACTION_MOVERIGHT])
+	{
+		side += sidemove[speed];
+	}
+	if (Actions[ACTION_MOVELEFT])
+	{
+		side -= sidemove[speed];
+	}
+
+	// buttons
+	// john - only add attack when console up
+	if (Actions[ACTION_ATTACK] && ConsoleState == c_up && HU_ChatMode() == CHAT_INACTIVE)
+		cmd->buttons |= BT_ATTACK;
+
+	if (Actions[ACTION_USE])
+		cmd->buttons |= BT_USE;
+
+	// Ch0wW : Forbid writing ACTION_JUMP to the demofile if recording a vanilla-compatible demo.
+	if (Actions[ACTION_JUMP])
+		cmd->buttons |= BT_JUMP;
+
+	// [RH] Handle impulses. If they are between 1 and 7,
+	//		they get sent as weapon change events.
+	// FIXME : "weapnext/weapprev" doesn't handle this properly, desyncing the demos.
+	if (Impulse >= 1 && Impulse <= 8)
+	{
+		cmd->buttons |= BT_CHANGE;
+		cmd->buttons |= (Impulse - 1) << BT_WEAPONSHIFT;
+	}
+	else
+	{
+		cmd->impulse = Impulse;
+	}
+	Impulse = 0;
+
+	// [SL] 2012-03-31 - Let the server know when the client is predicting a
+	// weapon change due to a weapon pickup
+	if (!serverside && cl_predictpickup)
+	{
+		if (!cmd->impulse && !(cmd->buttons & BT_CHANGE) &&
+			consoleplayer().pendingweapon != wp_nochange)
+			cmd->impulse = 50 + static_cast<int>(consoleplayer().pendingweapon);
+	}
+
+	if (::joyturn)
+	{
+		if (strafe || lookstrafe)
+		{
+			side += (int)(((float)::joyturn / (float)SHRT_MAX) * ::sidemove[speed]);
+		}
+		else
+		{
+			if (Actions[ACTION_FASTTURN])
+				cmd->yaw -= (short)((((float)joyturn / (float)SHRT_MAX) * angleturn[1]) *
+				                    (joy_fastsensitivity / 10));
+			else
+				cmd->yaw -= (short)((((float)joyturn / (float)SHRT_MAX) * angleturn[1]) *
+				                    (joy_sensitivity / 10));
+		}
+		::localview.skipangle = true;
+	}
+
+	if (Actions[ACTION_MLOOK])
+	{
+		if (joy_invert)
+			look += (int)(((float)joyforward / (float)SHRT_MAX) * lookspeed[speed]);
+		else
+			look -= (int)(((float)joyforward / (float)SHRT_MAX) * lookspeed[speed]);
+		::localview.skippitch = true;
+	}
+	else
+	{
+		forward -= (int)(((float)joyforward / (float)SHRT_MAX) * forwardmove[speed]);
+	}
+
+	if (!consoleplayer().spectator
+		&& !Actions[ACTION_MLOOK] && !cl_mouselook && novert == 0)		// [Toke - Mouse] acts like novert.exe
+	{
+		forward += (int)(float(mousey) * m_forward);
+	}
+
+	if (strafe || lookstrafe)
+		side += (int)(float(mousex) * m_side);
+
+	mousex = mousey = 0;
+
+	if (forward > MAXPLMOVE)
+		forward = MAXPLMOVE;
+	else if (forward < -MAXPLMOVE)
+		forward = -MAXPLMOVE;
+	if (side > MAXPLMOVE)
+		side = MAXPLMOVE;
+	else if (side < -MAXPLMOVE)
+		side = -MAXPLMOVE;
+
+	cmd->forwardmove += forward;
+	cmd->sidemove += side;
+	cmd->upmove = fly;
+
+	// special buttons
+	if (sendpause)
+	{
+		sendpause = false;
+		cmd->buttons = BT_SPECIAL | BTS_PAUSE;
+	}
+
+	if (sendsave)
+	{
+		sendsave = false;
+		cmd->buttons = BT_SPECIAL | BTS_SAVEGAME | (savegameslot << BTS_SAVESHIFT);
+	}
+
+	cmd->forwardmove <<= 8;
+	cmd->sidemove <<= 8;
+
+	//// [RH] 180-degree turn overrides all other yaws
+	if (turntick)
+	{
+		turntick--;
+		cmd->yaw = (ANG180 / TURN180_TICKS) >> 16;
+		::localview.skipangle = true;
+	}
+
+	if (sendcenterview && ConsoleState == c_up && !menuactive)
+	{
+		sendcenterview = false;
+		cmd->pitch = CENTERVIEW;
+	}
+	else
+	{
+		// [AM] LocalViewPitch is an offset on look.
+		cmd->pitch = look + (::localview.pitch >> 16);
+	}
+
+	if (::localview.setangle)
+	{
+		// [AM] LocalViewAngle is a global angle, only pave over the existing
+		//      yaw if we have local yaw.
+		cmd->yaw = ::localview.angle >> 16;
+	}
+
+	if (!longtics)
+		cmd->yaw = (cmd->yaw + 128) & 0xFF00;
+
+	::localview.angle = 0;
+	::localview.setangle = false;
+	::localview.pitch = 0;
+	::localview.setpitch = false;
+}
+
+
+// [RH] Spy mode has been separated into two console commands.
+//		One goes forward; the other goes backward.
+// denis - todo - should this be used somewhere?
+/*static void ChangeSpy (void)
+{
+	consoleplayer().camera = players[displayplayer].mo;
+	S_UpdateSounds(consoleplayer().camera);
+	ST_Start();		// killough 3/7/98: switch status bar views too
+}*/
+
+
+float G_ZDoomDIMouseScaleX(float x)
+{
+	return (x * 4.0 * mouse_sensitivity);
+}
+
+float G_ZDoomDIMouseScaleY(float y)
+{
+	return (y * mouse_sensitivity);
+}
+
+void G_ProcessMouseMovementEvent(const event_t *ev)
+{
+	static float fprevx = 0.0f, fprevy = 0.0f;
+	float fmousex = (float)ev->data2;
+	float fmousey = (float)ev->data3;
+
+	if (m_filter)
+	{
+		// smooth out the mouse input
+		fmousex = (fmousex + fprevx) / 2.0f;
+		fmousey = (fmousey + fprevy) / 2.0f;
+	}
+
+	fprevx = fmousex;
+	fprevy = fmousey;
+
+	fmousex = G_ZDoomDIMouseScaleX(fmousex);
+	fmousey = G_ZDoomDIMouseScaleY(fmousey);
+
+	mousex = (int)fmousex;
+	mousey = (int)fmousey;
+
+	G_AddViewAngle(fmousex * 8.0f * m_yaw);
+	G_AddViewPitch(fmousey * 16.0f * m_pitch);
+}
+
+void G_AddViewAngle(int yaw)
+{
+	if (G_ShouldIgnoreMouseInput())
+		return;
+
+	if (!Actions[ACTION_STRAFE] && !lookstrafe)
+	{
+		localview.angle -= yaw << 16;
+		localview.setangle = true;
+	}
+}
+
+void G_AddViewPitch(int pitch)
+{
+	if (G_ShouldIgnoreMouseInput())
+		return;
+
+	if (invertmouse)
+		pitch = -pitch;
+
+	if ((Actions[ACTION_MLOOK]) || (cl_mouselook && sv_freelook) ||
+	    consoleplayer().spectator || displayplayer().isFreecam)
+	{
+		localview.pitch += pitch << 16;
+		localview.setpitch = true;
+	}
+}
+
+bool G_ShouldIgnoreMouseInput()
+{
+	if ((consoleplayer().id != displayplayer().id || consoleplayer().playerstate == PST_DEAD) &&
+		not displayplayer().isFreecam)
+		return true;
+
+	return false;
+}
+
+//
+// G_Responder
+// Get info needed to make ticcmd_ts for the players.
+//
+bool G_Responder (event_t *ev)
+{
+	// any other key pops up menu if in demos
+	// [RH] But only if the key isn't bound to a "special" command
+	if (gameaction == ga_nothing &&
+		(demoplayback || gamestate == GS_DEMOSCREEN))
+	{
+		const char *cmd = Bindings.GetBind(ev->data1).c_str();
+
+		if (ev->type == ev_keydown)
+		{
+
+			if (!cmd || (
+				strnicmp (cmd, "menu_", 5) &&
+				stricmp (cmd, "toggleconsole") &&
+				stricmp (cmd, "sizeup") &&
+				stricmp (cmd, "sizedown") &&
+				stricmp (cmd, "togglemap") &&
+				stricmp (cmd, "spynext") &&
+				stricmp (cmd, "chase") &&
+				stricmp (cmd, "+showscores") &&
+				stricmp (cmd, "bumpgamma") &&
+				stricmp (cmd, "screenshot") &&
+                stricmp (cmd, "stepmode") &&
+                stricmp (cmd, "step")))
+			{
+				M_StartControlPanel ();
+				return true;
+			}
+			else
+			{
+				return C_DoKey (ev, &Bindings, &DoubleBindings);
+			}
+		}
+		if (cmd && cmd[0] == '+')
+			return C_DoKey(ev, &Bindings, &DoubleBindings);
+
+		return false;
+	}
+
+	if (gamestate == GS_LEVEL || gamestate == GS_INTERMISSION)
+	{
+		if (C_DoNetDemoKey(ev))	// netdemo playback ate the event
+			return true;
+		if (C_DoSpectatorKey(ev))
+			return true;
+
+		if (HU_Responder (ev))
+			return true;		// chat ate the event
+		if (ST_Responder (ev))
+			return true;		// status window ate it
+		if (!viewactive)
+			if (AM_Responder (ev))
+				return true;	// automap ate it
+	}
+	else if (gamestate == GS_FINALE)
+	{
+		if (F_Responder (ev))
+			return true;		// finale ate the event
+	}
+
+	switch (ev->type)
+	{
+	  case ev_keydown:
+		if (C_DoKey (ev, &Bindings, &DoubleBindings))
+			return true;
+		break;
+
+	  case ev_keyup:
+		C_DoKey(ev, &Bindings, &DoubleBindings);
+		break;
+
+	  // [Toke - Mouse] New mouse code
+	  case ev_mouse:
+		G_ProcessMouseMovementEvent(ev);
+
+		if (hud_mousegraph)
+			mousegraph.append(mousex, mousey);
+
+		break;
+
+	  case ev_joystick:
+	  	if(ev->data1 == 0) // Axis Movement
+		{
+			if(ev->data2 == joy_strafeaxis) // Strafe
+				joystrafe = ev->data3;
+			else if(ev->data2 == joy_forwardaxis) // Move
+				joyforward = ev->data3;
+			else if(ev->data2 == joy_turnaxis) // Turn
+				joyturn = ev->data3;
+			else if(ev->data2 == joy_lookaxis) // Look
+				joylook = ev->data3;
+			else
+				break; // The default case will be to treat the analog control as a button -- Hyper_Eye
+		}
+
+		break;
+
+	}
+
+	// [RH] If the view is active, give the automap a chance at
+	// the events *last* so that any bound keys get precedence.
+
+	if (gamestate == GS_LEVEL && viewactive)
+		return AM_Responder (ev);
+
+	if (ev->type == ev_keydown ||
+		ev->type == ev_mouse ||
+		ev->type == ev_joystick)
+		return true;
+	else
+		return false;
+}
+
+
+int netin;
+int netout;
+int outrate;
+
+BEGIN_COMMAND(netstat)
+{
+    PrintFmt(PRINT_HIGH, "in = {}  out = {} \n", netin, netout);
+}
+END_COMMAND(netstat)
+
+void P_BobTicker()
+{
+	bobx = P_TickWeaponBobX();
+	boby = P_TickWeaponBobY();
+}
+
+void P_CheckInterpPause()
+{
+	// Game pauses when in the menu and not online/demo
+	OInterpolation &oi = OInterpolation::getInstance();
+	if ((paused && not displayplayer().isFreecam) || (!multiplayer && !demoplayback &&
+		(menuactive || ConsoleState == c_down || ConsoleState == c_falling)))
+	{
+		if (oi.enabled())
+		{
+			oi.disable();
+		}
+	}
+	else
+	{
+		if (!oi.enabled())
+		{
+			oi.enable();
+		}
+	}
+}
+
+void CL_SimulateWorld();
+//
+// G_Ticker
+// Make ticcmd_ts for the players.
+//
+extern DCanvas *page;
+extern int connecttimeout;
+
+void G_Ticker (void)
+{
+	int 		buf;
+
+	// Turn off no-z-snapping for all players.
+	// [AM] Eventually, it would be nice to do this for all mobjs, but iterating
+	//      through every mobj every tic would be incredibly time-consuming.
+	if (!serverside)
+	{
+		for (auto& player : players)
+		{
+			if (player.mo)
+				player.mo->oflags &= ~MFO_NOSNAPZ;
+		}
+	}
+
+	// do player reborns if needed
+	if(serverside)
+		for (auto& player : players)
+		{
+			if (player.ingame() && (player.playerstate == PST_REBORN || player.playerstate == PST_ENTER))
+			{
+				if (player.playerstate == PST_REBORN)
+					player.doreborn = true;			// State only our will to lose the whole inventory in case of a reborn.
+				G_DoReborn(player);
+			}
+		}
+
+	// do things to change the game state
+	while (gameaction != ga_nothing)
+	{
+		switch (gameaction)
+		{
+		case ga_loadlevel:
+			G_DoLoadLevel (-1);
+			break;
+		case ga_fullresetlevel:
+			gameaction = ga_nothing;
+			break;
+		case ga_resetlevel:
+			gameaction = ga_nothing;
+			break;
+		case ga_newgame:
+			G_DoNewGame ();
+			break;
+		case ga_loadgame:
+			G_DoLoadGame ();
+			break;
+		case ga_savegame:
+			G_DoSaveGame ();
+			break;
+		case ga_playdemo:
+			G_DoPlayDemo ();
+			break;
+		case ga_completed:
+			G_DoCompleted ();
+			break;
+		case ga_victory:
+		    gameaction = ga_nothing;
+			break;
+		case ga_worlddone:
+			G_DoWorldDone ();
+			break;
+		case ga_screenshot:
+			V_ScreenShot(shotfile);
+			gameaction = ga_nothing;
+			break;
+		case ga_fullconsole:
+			if (demoplayback)
+				G_CheckDemoStatus();
+
+			extern bool advancedemo;
+			advancedemo = false;
+
+			if (gamestate != GS_STARTUP)
+			{
+				level.music.clear();
+				S_Start();
+				SN_StopAllSequences();
+				R_ExitLevel();
+			}
+
+			gamestate = GS_FULLCONSOLE;
+			C_FullConsole();
+
+			gameaction = ga_nothing;
+			break;
+		case ga_nothing:
+			break;
+		}
+		C_AdjustBottom ();
+	}
+
+	buf = gametic % BACKUPTICS;
+
+    // get commands
+	// [Blair] From all players in a demo playback.
+	if (demoplayback)
+	{
+		for (auto& player : players)
+		{
+			memcpy(&player.cmd, &player.netcmds[buf], sizeof(ticcmd_t));
+		}
+	}
+	// Rude - allow controlling displayplayer if freecam
+	else if (displayplayer().isFreecam)
+	{
+		memcpy(&displayplayer().cmd, &consoleplayer().netcmds[buf], sizeof(ticcmd_t));
+	}
+	else
+	{
+		memcpy(&consoleplayer().cmd, &consoleplayer().netcmds[buf], sizeof(ticcmd_t));
+	}
+
+    static int realrate = 0;
+    int packet_size;
+
+	if (demoplayback)
+		G_ReadDemoTiccmd(); // play all player commands
+
+	if(netdemo.isPlaying())
+	{
+		netdemo.readMessages(&net_message);
+	}
+
+	if (connected && !simulated_connection)
+	{
+		while ((packet_size = NET_GetPacket()) )
+		{
+			// denis - don't accept candy from strangers
+			if(!NET_CompareAdr(serveraddr, net_from))
+				break;
+
+			realrate += packet_size;
+			last_received = gametic;
+			noservermsgs = false;
+
+			if (!CL_ReadPacketHeader())
+				continue;
+
+			if (netdemo.isRecording())
+				netdemo.capture(&net_message);
+
+			CL_ParseCommands();
+
+			if (gameaction == ga_fullconsole) // Host_EndGame was called
+				return;
+		}
+
+		if (!(gametic%TICRATE))
+		{
+			netin = realrate;
+			realrate = 0;
+		}
+
+		CL_SaveCmd();      // save console commands
+		if (!noservermsgs)
+			CL_SendCmd();  // send console commands to the server
+
+		if (!(gametic%TICRATE))
+		{
+			netout = outrate;
+			outrate = 0;
+		}
+
+		if (gametic - last_received > 65)
+			noservermsgs = true;
+	}
+	else if (NET_GetPacket() && !simulated_connection)
+	{
+		// denis - don't accept candy from strangers
+		if (gamestate == GS_CONNECTING && NET_CompareAdr(serveraddr, net_from))
+		{
+			if (netdemo.isRecording())
+				netdemo.capture(&net_message);
+
+			int type = MSG_ReadLong();
+
+			if(type == MSG_CHALLENGE)
+			{
+				CL_PrepareConnect();
+			}
+			else if(type == 0)
+			{
+				if (!CL_Connect())
+					memset (&serveraddr, 0, sizeof(serveraddr));
+
+				connecttimeout = 0;
+			}
+			else
+			{
+				// we are already connected to this server, quit first
+				MSG_WriteMarker(&net_buffer, clc_disconnect);
+				NET_SendPacket(net_buffer, serveraddr);
+
+				PrintFmt(PRINT_WARNING,
+				         "Got unknown challenge {} while connecting, disconnecting.\n", type);
+			}
+		}
+	}
+
+	if (netdemo.isRecording())
+		netdemo.writeMessages();
+
+	// check for special buttons
+	if(serverside && consoleplayer().ingame())
+    {
+		// [Blair] Let's get all player's commands in a demo playback.
+		// Otherwise we might miss a pause and desync!
+		if (demoplayback)
+		{
+			for (const auto& player : players)
+			{
+				if (player.cmd.buttons & BT_SPECIAL)
+				{
+					switch (player.cmd.buttons & BT_SPECIALMASK)
+					{
+					case BTS_PAUSE:
+						paused ^= 1;
+						if (paused)
+						{
+							S_PauseSound();
+							S_PauseMusic();
+						}
+						else
+						{
+							S_ResumeSound();
+							S_ResumeMusic();
+						}
+						break;
+					}
+				}
+			}
+		}
+		else
+		{
+			player_t& player = consoleplayer();
+
+			if (player.cmd.buttons & BT_SPECIAL)
+			{
+				switch (player.cmd.buttons & BT_SPECIALMASK)
+				{
+				case BTS_PAUSE:
+					paused ^= 1;
+					if (paused)
+					{
+						S_PauseSound();
+						S_PauseMusic();
+					}
+					else
+					{
+						S_ResumeSound();
+						S_ResumeMusic();
+					}
+					break;
+
+				case BTS_SAVEGAME:
+					if (savedescription.empty())
+						savedescription = "NET GAME";
+					savegameslot = (player.cmd.buttons & BTS_SAVEMASK) >> BTS_SAVESHIFT;
+					gameaction = ga_savegame;
+					break;
+				}
+			}
+		}
+    }
+
+	// do main actions
+	switch (gamestate)
+	{
+	case GS_LEVEL:
+		if(clientside && !serverside)
+		{
+			if (!consoleplayer().mo)
+			{
+				// [SL] 2011-12-14 - Spawn message from server has not arrived
+				// yet.  Fake it and hope it arrives soon.
+				AActor *mobj = new AActor (0, 0, 0, MT_PLAYER);
+				mobj->flags &= ~MF_SOLID;
+				mobj->flags2 |= MF2_DONTDRAW;
+				consoleplayer().mo = consoleplayer().camera = mobj->ptr();
+				consoleplayer().mo->player = &consoleplayer();
+				G_PlayerReborn(consoleplayer());
+				DPrintFmt("Did not receive spawn for consoleplayer.\n");
+			}
+
+			CL_SimulateWorld();
+			CL_PredictWorld();
+
+			// Replay item pickups if the items arrived now.
+			ClientReplay::getInstance().itemReplay();
+		}
+		P_CheckInterpPause();
+		P_Ticker ();
+		P_BobTicker();
+		ST_Ticker ();
+		AM_Ticker ();
+		break;
+
+	case GS_INTERMISSION:
+		ST_Ticker ();
+		WI_Ticker ();
+		break;
+
+	case GS_FINALE:
+		F_Ticker ();
+		break;
+
+	case GS_DEMOSCREEN:
+		D_PageTicker ();
+		break;
+
+	default:
+		break;
+	}
+}
+
+
+//
+// PLAYER STRUCTURE FUNCTIONS
+// also see P_SpawnPlayer in P_Mobj
+//
+
+//
+// G_PlayerFinishLevel
+// Call when a player completes a level.
+//
+void G_PlayerFinishLevel (player_t& player)
+{
+	player.powers.fill(0);
+	player.cards.fill(false);
+
+	if(player.mo)
+		player.mo->flags &= ~MF_SHADOW; 	// cancel invisibility
+
+
+	SpreeManager::getInstance().erasePoints(player.id);
+	MultiKillManager::getInstance().eraseMultiKills(player.id);
+
+	player.extralight = 0;					// cancel gun flashes
+	player.fixedcolormap = 0;				// cancel ir goggles
+	player.damagecount = 0; 				// no palette changes
+	player.bonuscount = 0;
+}
+
+
+//
+// G_PlayerReborn
+// Called after a player dies
+// almost everything is cleared and initialized
+//
+void G_PlayerReborn (player_t &p) // [Toke - todo] clean this function
+{
+	size_t i;
+	for (i = 0; i < NUMAMMO; i++)
+	{
+		p.maxammo[i] = maxammo[i];
+		p.ammo[i] = 0;
+	}
+	for (i = 0; i < NUMWEAPONS; i++)
+		p.weaponowned[i] = false;
+
+	if (!sv_keepkeys && !sv_sharekeys)
+		P_ClearPlayerCards(p);
+
+	P_ClearPlayerPowerups(p);
+
+	for (i = 0; i < NUMTEAMS; i++)
+		p.flags[i] = false;
+	p.backpack = false;
+
+	G_GiveSpawnInventory(p);
+
+	p.usedown = p.attackdown = true;	// don't do anything immediately
+	p.playerstate = PST_LIVE;
+	p.weaponowned[NUMWEAPONS] = true;
+
+	if (!p.spectator)
+		p.cheats = 0; // Reset cheat flags
+
+	p.death_time = 0;
+	p.tic = 0;
+}
+
+//
+// G_CheckSpot
+// Returns false if the player cannot be respawned
+// at the given mapthing2_t spot
+// because something is occupying it
+//
+void P_SpawnPlayer(player_t &player, const mapthing2_t& mthing);
+
+bool G_CheckSpot(player_t &player, const mapthing2_t& mthing)
+{
+	unsigned			an;
+	AActor* 			mo;
+	fixed_t 			xa,ya;
+
+	const fixed_t x = mthing.x << FRACBITS;
+	const fixed_t y = mthing.y << FRACBITS;
+	fixed_t z = P_FloorHeight(x, y);
+
+	if (level.flags & LEVEL_USEPLAYERSTARTZ)
+		z = mthing.z << FRACBITS;
+
+	if (!player.mo)
+	{
+		// first spawn of level, before corpses
+		for (Players::iterator it = players.begin();it != players.end();++it)
+		{
+			if (&player == &*it)
+				continue;
+
+			if (it->mo && it->mo->x == x && it->mo->y == y)
+				return false;
+		}
+		return true;
+	}
+
+	fixed_t oldz = player.mo->z;	// [RH] Need to save corpse's z-height
+	player.mo->z = z;		// [RH] Checks are now full 3-D
+
+	// killough 4/2/98: fix bug where P_CheckPosition() uses a non-solid
+	// corpse to detect collisions with other players in DM starts
+	//
+	// Old code:
+	// if (!P_CheckPosition (players[playernum].mo, x, y))
+	//    return false;
+
+	player.mo->flags |=  MF_SOLID;
+	bool valid_position = P_CheckPosition(player.mo, x, y);
+	player.mo->flags &= ~MF_SOLID;
+	player.mo->z = oldz;	// [RH] Restore corpse's height
+	if (!valid_position)
+		return false;
+
+	// spawn a teleport fog
+//	if (!player.spectator && !player.deadspectator)	// ONLY IF THEY ARE NOT A SPECTATOR
+	if (!player.spectator)	// ONLY IF THEY ARE NOT A SPECTATOR
+	{
+		// emulate out-of-bounds access to finecosine / finesine tables
+		// which cause west-facing player spawns to have the spawn-fog
+		// and its sound located off the map in vanilla Doom.
+
+		// borrowed from Eternity Engine
+
+		// haleyjd: There was a weird bug with this statement:
+		//
+		// an = (ANG45 * (mthing->angle/45)) >> ANGLETOFINESHIFT;
+		//
+		// Even though this code stores the result into an unsigned variable, most
+		// compilers seem to ignore that fact in the optimizer and use the resulting
+		// value directly in a lea instruction. This causes the signed mapthing_t
+		// angle value to generate an out-of-bounds access into the fine trig
+		// lookups. In vanilla, this accesses the finetangent table and other parts
+		// of the finesine table, and the result is what I call the "ninja spawn,"
+		// which is missing the fog and sound, as it spawns somewhere out in the
+		// far reaches of the void.
+
+		if (co_nosilentspawns)
+		{
+			an = ( ANG45 * ((unsigned int)mthing.angle/45) ) >> ANGLETOFINESHIFT;
+			xa = finecosine[an];
+			ya = finesine[an];
+		}
+		else
+		{
+			angle_t mtangle = (angle_t)(mthing.angle / 45);
+
+			an = ANG45 * mtangle;
+
+			switch(mtangle)
+			{
+				case 4: // 180 degrees (0x80000000 >> 19 == -4096)
+					xa = finetangent[2048];
+					ya = finetangent[0];
+					break;
+				case 5: // 225 degrees (0xA0000000 >> 19 == -3072)
+					xa = finetangent[3072];
+					ya = finetangent[1024];
+					break;
+				case 6: // 270 degrees (0xC0000000 >> 19 == -2048)
+					xa = finesine[0];
+					ya = finetangent[2048];
+					break;
+				case 7: // 315 degrees (0xE0000000 >> 19 == -1024)
+					xa = finesine[1024];
+					ya = finetangent[3072];
+					break;
+				default: // everything else works properly
+					xa = finecosine[an >> ANGLETOFINESHIFT];
+					ya = finesine[an >> ANGLETOFINESHIFT];
+					break;
+			}
+		}
+
+		mo = new AActor(x + 20 * xa, y + 20 * ya, z + INT2FIXED(gameinfo.telefogHeight), MT_TFOG);
+
+		if (level.time)
+			S_Sound (mo, CHAN_VOICE, "misc/teleport", 1, ATTN_NORM);	// don't start sound on first frame
+	}
+
+	return true;
+}
+
+
+//
+// G_DeathMatchSpawnPlayer
+// Spawns a player at one of the random death match spots
+// called at level load and each death
+//
+
+// [RH] Returns the distance of the closest player to the given mapthing2_t.
+// denis - todo - should this be used somewhere?
+/*static fixed_t PlayersRangeFromSpot (mapthing2_t *spot)
+{
+	fixed_t closest = MAXINT;
+	fixed_t distance;
+
+	for (size_t i = 0; i < players.size(); i++)
+	{
+		if (!players[i].ingame() || !players[i].mo || players[i].health <= 0)
+			continue;
+
+		distance = P_AproxDistance (players[i].mo->x - spot->x * FRACUNIT,
+									players[i].mo->y - spot->y * FRACUNIT);
+
+		if (distance < closest)
+			closest = distance;
+	}
+
+	return closest;
+}
+
+// [RH] Select the deathmatch spawn spot farthest from everyone.
+static mapthing2_t *SelectFarthestDeathmatchSpot (int selections)
+{
+	fixed_t bestdistance = 0;
+	mapthing2_t *bestspot = NULL;
+	int i;
+
+	for (i = 0; i < selections; i++)
+	{
+		fixed_t distance = PlayersRangeFromSpot (&deathmatchstarts[i]);
+
+		if (distance > bestdistance)
+		{
+			bestdistance = distance;
+			bestspot = &deathmatchstarts[i];
+		}
+	}
+
+	return bestspot;
+}
+
+*/
+
+// [RH] Select a deathmatch spawn spot at random (original mechanism)
+static mapthing2_t *SelectRandomDeathmatchSpot (player_t &player, int selections)
+{
+	int i = 0;
+
+	for (int j = 0; j < 20; j++)
+	{
+		i = P_Random () % selections;
+		if (G_CheckSpot (player, DeathMatchStarts[i]) )
+			return &DeathMatchStarts[i];
+	}
+
+	// [RH] return a spot anyway, since we allow telefragging when a player spawns
+	return &DeathMatchStarts[i];
+}
+
+void G_DeathMatchSpawnPlayer (player_t &player)
+{
+	if(!serverside || G_UsesCoopSpawns())
+		return;
+
+	const size_t selections = DeathMatchStarts.size();
+	// [RH] We can get by with just 1 deathmatch start
+	if (selections < 1)
+		I_Error ("No deathmatch starts");
+
+	// [Toke - dmflags] Old location of DF_SPAWN_FARTHEST
+	mapthing2_t* spot = SelectRandomDeathmatchSpot (player, static_cast<int>(selections));
+
+	if (!spot && !playerstarts.empty())
+	{
+		// no good spot, so the player will probably get stuck
+		spot = &playerstarts[player.id%playerstarts.size()];
+	}
+	else
+	{
+		if (player.id < 4)
+			spot->type = player.id+1;
+		else
+			spot->type = player.id+4001-4;	// [RH] > 4 players
+	}
+
+	P_SpawnPlayer (player, *spot);
+}
+
+//
+// G_DoReborn
+//
+void G_DoReborn (player_t &player)
+{
+	if(!serverside)
+		return;
+
+	if (!multiplayer)
+	{
+		// reload the level from scratch
+		gameaction = ga_loadlevel;
+		return;
+	}
+
+	// respawn at the start
+	// first disassociate the corpse
+	if (player.mo)
+		player.mo->player = NULL;
+
+	// spawn at random spot if in death match
+	if (!G_UsesCoopSpawns())
+	{
+		G_DeathMatchSpawnPlayer (player);
+		return;
+	}
+
+	if(playerstarts.empty())
+		I_Error("No player starts");
+
+	unsigned int playernum = player.id - 1;
+
+	if (G_CheckSpot(player, playerstarts[playernum%playerstarts.size()]) )
+	{
+		P_SpawnPlayer(player, playerstarts[playernum%playerstarts.size()]);
+		return;
+	}
+
+	// try to spawn at one of the other players' spots
+	for (auto& playerstart : playerstarts)
+	{
+		if (G_CheckSpot(player, playerstart) )
+		{
+			P_SpawnPlayer(player, playerstart);
+			return;
+		}
+	}
+
+	// he's going to be inside something.  Too bad.
+	P_SpawnPlayer(player, playerstarts[playernum%playerstarts.size()]);
+}
+
+
+void G_ScreenShot(const char* filename)
+{
+   // SoM: THIS CRASHES A LOT
+   if (filename && *filename)
+	   shotfile = filename;
+   else
+      shotfile = "";
+
+	gameaction = ga_screenshot;
+}
+
+
+
+//
+// G_InitFromSavegame
+// Can be called by the startup code or the menu task.
+//
+std::string savename;
+
+void G_LoadGame (const std::string& name)
+{
+	savename = name;
+	gameaction = ga_loadgame;
+}
+
+
+void G_DoLoadGame (void)
+{
+    unsigned int i;
+	char text[16];
+
+	gameaction = ga_nothing;
+
+	auto stdfile = uqFile(fopen(savename.c_str(), "rb"));
+	if (stdfile == nullptr)
+	{
+		PrintFmt(PRINT_HIGH, "Could not read savegame '{}'\n", savename);
+		return;
+	}
+
+	fseek (stdfile.get(), SAVESTRINGSIZE, SEEK_SET);	// skip the description field
+	size_t readlen = fread (text, 16, 1, stdfile.get());
+	if (readlen < 1)
+	{
+		PrintFmt(PRINT_HIGH, "Failed to read savegame '{}'\n", savename);
+		return;
+	}
+	if (strncmp (text, SAVESIG, 16))
+	{
+		PrintFmt(PRINT_HIGH, "Savegame '{}' is from a different version\n", savename);
+		return;
+	}
+	readlen = fread (text, 8, 1, stdfile.get());
+	if (readlen < 1)
+	{
+		PrintFmt(PRINT_HIGH, "Failed to read savegame '{}'\n", savename);
+		return;
+	}
+	text[8] = 0;
+
+	/*bglobal.RemoveAllBots (true);*/
+
+	FLZOFile savefile (stdfile.release(), FFile::EReading);
+
+	if (!savefile.IsOpen ())
+		I_Error("Savegame '{}' is corrupt\n", savename);
+
+	PrintFmt(PRINT_HIGH, "Loading savegame '{}'...\n", savename);
+
+	CL_QuitNetGame(NQ_SILENT);
+
+	FArchive arc (savefile);
+
+	{
+		byte vars[4096], *vars_p;
+		unsigned int len;
+		vars_p = vars;
+		len = arc.ReadCount ();
+		arc.Read (vars, len);
+		cvar_t::C_ReadCVars (&vars_p);
+	}
+
+	// dearchive all the modifications
+	G_SerializeSnapshots (arc);
+	P_SerializeRNGState (arc);
+	P_SerializeACSDefereds (arc);
+	P_SerializeHorde(arc);
+
+	multiplayer = false;
+
+	// load a base level
+	savegamerestore = true;		// Use the player actors in the savegame
+	serverside = true;
+	G_InitNew(text);
+	displayplayer_id = consoleplayer_id = 1;
+	savegamerestore = false;
+
+	arc >> level.time;
+
+	P_SerializeMusInfo(arc);
+
+	for (i = 0; i < NUM_WORLDVARS; i++)
+	{
+		arc >> ACS_WorldVars[i];
+		int size, k, v;
+		arc >> size;
+		for (int j = 0; j < size; j++)
+		{
+			arc >> k;
+			arc >> v;
+			ACS_WorldArrays[i][k] = v;
+		}
+	}
+
+	for (i = 0; i < NUM_GLOBALVARS; i++)
+	{
+		arc >> ACS_GlobalVars[i];
+		int size, k, v;
+		arc >> size;
+		for (int j = 0; j < size; j++)
+		{
+			arc >> k;
+			arc >> v;
+			ACS_GlobalArrays[i][k] = v;
+		}
+	}
+
+	arc >> text[9];
+
+	arc.Close ();
+
+	if (text[9] != 0x1d)
+		I_Error ("Bad savegame");
+
+	P_HordePostLoad();
+}
+
+
+//
+// G_SaveGame
+// Called by the menu task.
+// Description is a 24 byte text string
+//
+void G_SaveGame (int slot, std::string_view description)
+{
+	savegameslot = slot;
+	savedescription = description;
+	sendsave = true;
+}
+
+/**
+ * @brief Create a filename for a savegame.
+ *
+ * @param name Output string.
+ * @param slot Slot number.
+ */
+void G_BuildSaveName(std::string &name, int slot)
+{
+	std::string path = M_GetUserFileName(name);
+	name = fmt::sprintf("%s" PATHSEP "odasv%d.ods", path, slot);
+}
+
+void G_DoSaveGame()
+{
+	std::string name, description;
+
+	G_SnapshotLevel ();
+
+	G_BuildSaveName (name, savegameslot);
+	description = savedescription;
+
+	FILE *stdfile = fopen (name.c_str(), "wb");
+
+	if (stdfile == NULL)
+	{
+        return;
+	}
+
+	PrintFmt(PRINT_HIGH, "Saving game to '{}'...\n", name);
+
+	fwrite (description.c_str(), SAVESTRINGSIZE, 1, stdfile);
+	fwrite (SAVESIG, 16, 1, stdfile);
+	fwrite (level.mapname.c_str(), 8, 1, stdfile);
+
+	FLZOFile savefile (stdfile, FFile::EWriting, true);
+	FArchive arc (savefile);
+
+	{
+		byte vars[4096], *vars_p;
+		vars_p = vars;
+
+		cvar_t::C_WriteCVars (&vars_p, CVAR_SERVERINFO, 4096);
+		arc.WriteCount (vars_p - vars);
+		arc.Write (vars, vars_p - vars);
+	}
+
+	G_SerializeSnapshots (arc);
+	P_SerializeRNGState (arc);
+	P_SerializeACSDefereds (arc);
+	P_SerializeHorde(arc);
+
+	arc << level.time;
+	P_SerializeMusInfo(arc);
+
+	for (int i = 0; i < NUM_WORLDVARS; i++)
+	{
+		arc << ACS_WorldVars[i];
+		ACSWorldGlobalArray worldarr = ACS_WorldArrays[i];
+		arc << worldarr.size();
+		for (const auto& [key, val] : worldarr)
+		{
+			arc << key;
+			arc << val;
+		}
+	}
+
+	for (int i = 0; i < NUM_GLOBALVARS; i++)
+	{
+		arc << ACS_GlobalVars[i];
+		ACSWorldGlobalArray globalarr = ACS_GlobalArrays[i];
+		arc << globalarr.size();
+		for (const auto& [key, val] : globalarr)
+		{
+			arc << key;
+			arc << val;
+		}
+	}
+
+	arc << (byte)0x1d;			// consistancy marker
+
+	gameaction = ga_nothing;
+	savedescription[0] = 0;
+
+	PrintFmt(PRINT_HIGH, "{}\n", GStrings(GGSAVED));
+	arc.Close ();
+
+    if (level.info->snapshot != NULL)
+    {
+        delete level.info->snapshot;
+        level.info->snapshot = NULL;
+    }
+}
+
+
+
+
+//
+// DEMO RECORDING
+//
+#define DEMOMARKER				0x80
+#define DEMOSTOP				0x07
+
+void G_ReadDemoTiccmd()
+{
+	if (demoversion == LMP_DOOM_1_9 || demoversion == LMP_DOOM_1_9_1)
+	{
+		int demostep = (demoversion == LMP_DOOM_1_9_1) ? 5 : 4;
+
+		for (auto& player : players)
+		{
+			if ((demo_e - demo_p < demostep) || (*demo_p == DEMOMARKER))
+			{
+				// end of demo data stream
+				G_CheckDemoStatus();
+				return;
+			}
+
+			player.cmd.forwardmove = ((signed char)*demo_p++) << 8;
+			player.cmd.sidemove = ((signed char)*demo_p++) << 8;
+
+			if (demoversion == LMP_DOOM_1_9)
+			{
+				player.cmd.yaw = ((unsigned char)*demo_p++) << 8;
+			}
+			else
+			{
+				player.cmd.yaw = ((unsigned short)*demo_p++);
+				player.cmd.yaw |= ((unsigned short)*demo_p++) << 8;
+			}
+			player.cmd.buttons = (unsigned char)*demo_p++;
+		}
+	}
+}
+
+//
+// G_PlayDemo
+//
+
+std::string defdemoname;
+
+void G_DeferedPlayDemo (const char *name, bool bIsSingleDemo)
+{
+	defdemoname = name;
+
+	if (bIsSingleDemo)
+		singledemo = true;
+
+	gameaction = ga_playdemo;
+}
+
+BEGIN_COMMAND(stopdemo)
+{
+	G_CheckDemoStatus ();
+}
+END_COMMAND(stopdemo)
+
+BEGIN_COMMAND(playdemo)
+{
+	if(argc > 1)
+	{
+		extern bool lastWadRebootSuccess;
+		if(lastWadRebootSuccess)
+		{
+			G_DeferedPlayDemo(argv[1], true);
+		}
+		else
+		{
+			PrintFmt(PRINT_WARNING, "Cannot play demo because WAD didn't load\n");
+			PrintFmt(PRINT_WARNING, "Use the 'wad' command\n");
+		}
+	}
+	else
+		PrintFmt(PRINT_HIGH, "Usage: playdemo lumpname or file\n");
+}
+END_COMMAND(playdemo)
+
+BEGIN_COMMAND(streamdemo)
+{
+	if(argc > 1)
+	{
+		G_DeferedPlayDemo(argv[1]);
+		G_DoPlayDemo(true);
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "Usage: streamdemo lumpname or file\n");
+	}
+}
+END_COMMAND(streamdemo)
+
+
+//
+// G_DoPlayDemo
+//
+// Plays the vanilla LMP demo defdemoname (either in the loaded WAD files
+// or as an external file).
+//
+// If justStreamInput is true, the recorded game parameters will be ignored.
+// This is used to stream input to the client while connected to a server
+// for regression testing purposes.
+//
+void G_DoPlayDemo(bool justStreamInput)
+{
+	if (!justStreamInput)
+		CL_QuitNetGame(NQ_SILENT);
+
+	gameaction = ga_nothing;
+	int bytelen;
+
+	int demolump = W_CheckNumForName(defdemoname);
+	if (demolump != -1)
+	{
+		demobuffer = demo_p = (byte*)W_CacheLumpNum(demolump, PU_STATIC);
+		bytelen = W_LumpLength(demolump);
+	}
+	else
+	{
+		// [RH] Allow for demos not loaded as lumps
+		std::string found = M_FindUserFileName(::defdemoname, ".lmp");
+		if (found.empty())
+		{
+			PrintFmt(PRINT_WARNING, "Could not find demo {}\n", ::defdemoname);
+			gameaction = ga_fullconsole;
+			return;
+		}
+		::defdemoname = found;
+
+		bytelen = M_ReadFile(defdemoname, &demobuffer);
+		demo_p = demobuffer;
+	}
+
+	demo_e = demo_p + bytelen;
+
+	if (bytelen < 14)
+	{
+		if (bytelen)
+			Z_Free(demobuffer);
+
+		PrintFmt(PRINT_WARNING, "DOOM Demo file too short\n");
+		gameaction = ga_fullconsole;
+		return;
+	}
+
+	if (demo_p[0] == DOOM_1_4_DEMO ||
+		demo_p[0] == DOOM_1_5_DEMO ||
+		demo_p[0] == DOOM_1_6_DEMO ||
+		demo_p[0] == DOOM_1_7_DEMO ||
+		demo_p[0] == DOOM_1_8_DEMO ||
+		demo_p[0] == DOOM_1_9_DEMO ||
+		demo_p[0] == DOOM_1_9p_DEMO ||
+		demo_p[0] == DOOM_1_9_1_DEMO)
+	{
+		PrintFmt(PRINT_HIGH, "Playing DOOM demo {}\n", defdemoname);
+
+		demostartgametic = gametic;
+		demoversion = *demo_p++ == DOOM_1_9_1_DEMO ? LMP_DOOM_1_9_1 : LMP_DOOM_1_9;
+
+		byte skill = *demo_p++ + 1;
+
+		byte episode = *demo_p++;
+		byte map = *demo_p++;
+		const OLumpName mapname = gameinfo.flags & GI_MAPxx ?
+			fmt::format("MAP{:02d}", map) :
+			fmt::format("E{}M{}", episode, map);
+
+		int deathmatch = *demo_p++;
+		bool monstersrespawn = *demo_p++;
+		bool fastmonsters = *demo_p++;
+		bool nomonsters = *demo_p++;
+		byte who = *demo_p++;
+
+		if (!justStreamInput)
+			players.clear();
+
+		for (size_t i = 0 ; i < MAXPLAYERS_VANILLA; i++)
+		{
+			if (*demo_p++ && !justStreamInput)
+			{
+				player_t* player = &players.emplace_back();
+				player->playerstate = PST_REBORN;
+				player->id = (byte)i + 1;
+			}
+		}
+
+		demoplayback = true;
+
+		if (!justStreamInput)
+		{
+			player_t &con = idplayer(who + 1);
+
+			if (!validplayer(con))
+			{
+				Z_Free(demobuffer);
+				PrintFmt(PRINT_HIGH, "DOOM Demo: invalid console player {} of {}\n", who + 1, players.size());
+				gameaction = ga_fullconsole;
+				return;
+			}
+
+			consoleplayer_id = displayplayer_id = con.id;
+
+			if (players.size() > 1)
+				multiplayer = true;
+			else
+				multiplayer = false;
+
+			serverside = true;
+
+			// [SL] 2012-12-26 - Backup any cvars that need to be set to default to
+			// ensure demo compatibility. CVAR_SERVERINFO cvars is a handy superset
+			// of those cvars
+			cvar_t::C_BackupCVars(CVAR_SERVERINFO);
+			cvar_t::C_SetCVarsToDefaults(CVAR_SERVERINFO);
+
+			sv_skill.Set(skill);
+			sv_monstersrespawn.Set(monstersrespawn);
+			sv_fastmonsters.Set(fastmonsters);
+			sv_nomonsters.Set(nomonsters);
+
+			if (deathmatch == 2)
+			{
+				// Altdeath
+				sv_gametype.Set(GM_DM);
+				sv_weaponstay.Set(0.0f);
+				sv_itemsrespawn.Set(1.0f);
+			}
+			else if (deathmatch == 1)
+			{
+				// Classic deathmatch
+				sv_gametype.Set(GM_DM);
+				sv_weaponstay.Set(1.0f);
+				sv_itemsrespawn.Set(0.0f);
+			}
+			else
+			{
+				// Co-op
+				sv_gametype.Set(GM_COOP);
+				sv_weaponstay.Set(1.0f);
+				sv_itemsrespawn.Set(0.0f);
+			}
+
+			sv_respawnsuper.Set(0.0f);
+			sv_respawnbarrels.Set(0.0f);
+
+			usergame = false;
+		}
+
+		// Set up the colors and names for the demo players
+		for (auto& player : players)
+		{
+			R_BuildClassicPlayerTranslation(player.id, player.id - 1);
+			argb_t color(translationRGB[player.id][0]);
+
+			player.userinfo.color[0] = color.geta();
+			player.userinfo.color[1] = color.getr();
+			player.userinfo.color[2] = color.getg();
+			player.userinfo.color[3] = color.getb();
+
+			player.userinfo.netname = fmt::format("Players {}", player.id);
+		}
+
+		if (!justStreamInput)
+			G_InitNew(mapname);
+
+	}
+	else
+	{
+		PrintFmt(PRINT_WARNING, "Unsupported demo format.  If you are trying to play an Odamex " \
+						"netdemo, please use the netplay command\n");
+		gameaction = ga_nothing;
+	}
+}
+
+//
+// G_TimeDemo
+//
+void G_TimeDemo(const char* name)
+{
+	nodrawers = Args.CheckParm ("-nodraw");
+	noblit = Args.CheckParm ("-noblit");
+	timingdemo = true;
+
+	defdemoname = name;
+	gameaction = ga_playdemo;
+
+	IWindow* window = I_GetWindow();
+	if (noblit)
+		window->disableRefresh();
+	else
+		window->enableRefresh();
+}
+
+
+//
+// G_TestDemo
+//
+void G_TestDemo(const char* name)
+{
+	nodrawers = noblit = true;
+	timingdemo = true;			// don't call I_Sleep in between frames
+	extern bool demotest;
+	demotest = true;
+
+	defdemoname = name;
+	gameaction = ga_playdemo;
+}
+
+
+//
+// G_CleanupDemo
+//
+void G_CleanupDemo()
+{
+	if (demoplayback)
+	{
+		Z_Free(demobuffer);
+
+		demoplayback = false;
+		multiplayer = false;
+		serverside = false;
+
+		cvar_t::C_RestoreCVars();		// [RH] Restore cvars demo might have changed
+	}
+}
+
+
+/*
+===================
+=
+= G_CheckDemoStatus
+=
+= Called after a death or level completion to allow demos to be cleaned up
+= Returns true if a new demo loop action will take place
+===================
+*/
+
+bool G_CheckDemoStatus (void)
+{
+	if (demoplayback)
+	{
+		G_CleanupDemo();
+
+		extern bool demotest;
+		if (demotest)
+		{
+			AActor *mo = idplayer(1).mo;
+
+			if (mo)
+				PrintFmt(PRINT_HIGH, "demotest:{:x} {:x} {:x} {:x}\n",
+					static_cast<uint32_t>(mo->angle),
+					static_cast<uint32_t>(mo->x),
+					static_cast<uint32_t>(mo->y),
+					static_cast<uint32_t>(mo->z));
+			else
+				PrintFmt(PRINT_WARNING, "demotest:no player\n");
+
+			demotest = false;
+
+			// exit the application
+			CL_QuitCommand();
+			return false;
+		}
+
+		if (singledemo || timingdemo)
+		{
+			if (timingdemo)
+			{
+				extern dtime_t starttime;
+				dtime_t endtime = I_MSTime() - starttime;
+				int realtics = endtime * TICRATE / 1000;
+				float fps = float(gametic * TICRATE) / realtics;
+
+				PrintFmt(PRINT_HIGH, "timed {} gametics in {} realtics ({:.1f} fps)\n",
+				         gametic, realtics, fps);
+
+				// exit the application
+				CL_QuitCommand();
+				return false;
+			}
+			else
+				PrintFmt(PRINT_HIGH, "Demo ended.\n");
+
+			demoplayback = false;
+			gameaction = ga_fullconsole;
+			timingdemo = false;
+			return false;
+		}
+
+
+		D_AdvanceDemo ();
+		return true;
+	}
+
+	return false;
+}
+
+
+VERSION_CONTROL (g_game_cpp, "$Id: 0553493482dffa8966e4fa137f9d6e57b737ed5e $")

@@ -1,0 +1,555 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 6657822cd033e6dffd4a4a6dff5a6fb208d9078c $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	HTTP Downloading.
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "cl_download.h"
+
+#ifdef __EMSCRIPTEN__
+
+// The browser build has no curl, so WAD downloads are unavailable.  The page
+// supplies every WAD up front instead.
+
+void CL_DownloadInit() {}
+void CL_DownloadShutdown() {}
+bool CL_IsDownloading() { return false; }
+bool CL_StartDownload(const Websites&, const OWantFile&, unsigned) { return false; }
+bool CL_StopDownload() { return false; }
+void CL_DownloadTick() {}
+std::string CL_DownloadFilename() { return ""; }
+OTransferProgress CL_DownloadProgress() { return OTransferProgress(); }
+
+#else
+
+#ifndef CURL_STATICLIB
+#define CURL_STATICLIB
+#endif
+#include "curl/curl.h"
+
+#include "c_dispatch.h"
+#include "cl_main.h"
+#include "cmdlib.h"
+#include "i_system.h"
+#include "m_argv.h"
+#include "m_fileio.h"
+#include "w_ident.h"
+#include "m_random.h"
+
+EXTERN_CVAR(cl_waddownloaddir)
+EXTERN_CVAR(waddirs)
+
+enum States
+{
+	STATE_SHUTDOWN,
+	STATE_READY,
+	STATE_CHECKING,
+	STATE_DOWNLOADING
+};
+
+static struct DownloadState
+{
+  public:
+	States state = STATE_SHUTDOWN;
+	std::unique_ptr<OTransferCheck> check;
+	std::unique_ptr<OTransfer> transfer;
+	std::string url;
+	std::string filename;
+	OMD5Hash hash{};
+	uint32_t flags = 0;
+	Websites checkurls{};
+	size_t checkurlidx = 0;
+	std::string checkfilename{};
+	int checkfails = 0;
+	DownloadState(const DownloadState&) = delete;
+	DownloadState& operator=(const DownloadState&) = delete;
+	DownloadState(DownloadState&&) = delete;
+	DownloadState& operator=(DownloadState&&) = delete;
+	DownloadState() = default;
+	void Ready()
+	{
+		this->state = STATE_READY;
+		this->check.reset();
+		this->transfer.reset();
+		this->url = "";
+		this->filename = "";
+		this->hash = OMD5Hash();
+		this->flags = 0;
+		this->checkurls.clear();
+		this->checkurlidx = 0;
+		this->checkfilename = "";
+		this->checkfails = 0;
+	}
+} dlstate;
+
+/**
+ * @brief Init the HTTP download system.
+ */
+void CL_DownloadInit()
+{
+	PrintFmt("CL_DownloadInit: Init HTTP subsystem (libcurl {}.{}.{})\n",
+	         LIBCURL_VERSION_MAJOR, LIBCURL_VERSION_MINOR, LIBCURL_VERSION_PATCH);
+
+	curl_global_init(CURL_GLOBAL_ALL);
+
+	::dlstate.state = STATE_READY;
+}
+
+/**
+ * @brief Shutdown the HTTP download system completely.
+ */
+void CL_DownloadShutdown()
+{
+	if (::dlstate.state == STATE_SHUTDOWN)
+		return;
+
+	::dlstate.check.reset();
+	::dlstate.transfer.reset();
+
+	curl_global_cleanup();
+	::dlstate.state = STATE_SHUTDOWN;
+}
+
+/**
+ * @brief Get the current state of any file transfer.
+ *
+ * @return true if there is a download in progress.
+ */
+bool CL_IsDownloading()
+{
+	return ::dlstate.state == STATE_CHECKING || ::dlstate.state == STATE_DOWNLOADING;
+}
+
+/**
+ * @brief Start a transfer.
+ *
+ * @param urls Website to download from, without the WAD at the end.
+ * @param filename Filename of the WAD to download.
+ * @param flags DL_* flags to set for the download process.
+ */
+bool CL_StartDownload(const Websites& urls, const OWantFile& filename, unsigned flags)
+{
+	if (::dlstate.state != STATE_READY)
+	{
+		PrintFmt(PRINT_WARNING, "Can't start download when download state is not ready.\n");
+		return false;
+	}
+
+	// Remove all URL's that don't look like URL's.
+	Websites checkurls;
+	Websites::const_iterator wit = urls.begin();
+	for (; wit != urls.end(); ++wit)
+	{
+		// Ensure the URL exists.
+		if (wit->empty())
+			continue;
+
+		// Ensure that the URL begins with the proper protocol.
+		if (wit->find("http://", 0) != 0 && wit->find("https://", 0) != 0)
+			continue;
+
+		// Ensure the URL ends with a slash.
+		std::string url = *wit;
+		const char cmp = *(url.rbegin());
+		if (cmp != '/' && cmp != '=')
+			url += '/';
+
+		checkurls.push_back(url);
+	}
+
+	if (checkurls.empty())
+	{
+		PrintFmt(PRINT_WARNING, "No sites were provided for download.\n");
+		return false;
+	}
+
+	if (W_IsFilenameCommercialWAD(filename.getBasename()))
+	{
+		PrintFmt(PRINT_WARNING, "{} is a commercial WAD file and cannot be downloaded by Odamex.\n"
+		                        "A copy can be obtained through purchasing DOOM + DOOM II from Steam or GOG.\n",
+		                        filename.getBasename());
+		return false;
+	}
+
+	if (W_IsFilehashCommercialWAD(filename.getWantedMD5()))
+	{
+		const fileIdentifier_t* id = W_GameInfo(filename.getWantedMD5());
+		PrintFmt(PRINT_WARNING, "{} is a renamed commercial wad file containing {}.\n"
+		                        "A copy of {} can be obtained through purchasing DOOM + DOOM II from Steam or GOG.\n",
+		                        filename.getBasename(), id->mNiceName, id->mFilename);
+		return false;
+	}
+
+	// Add a slash to the end of the base sites.
+	::dlstate.checkurls = checkurls;
+
+	// Assign the other params to the download state.
+	::dlstate.filename = filename.getBasename();
+	::dlstate.hash = filename.getWantedMD5();
+	::dlstate.flags = flags;
+
+	// Start the checking bit on the next tick.
+	::dlstate.state = STATE_CHECKING;
+	return true;
+}
+
+/**
+ * @brief Cancel an in-progress download.
+ *
+ * @return True if a download was cancelled, otherwise false.
+ */
+bool CL_StopDownload()
+{
+	if (!CL_IsDownloading())
+		return false;
+
+	::dlstate.Ready();
+	return true;
+}
+
+/**
+ * @brief Called after a check is done.
+ *
+ * @param info Completed check info.
+ */
+static void CheckDone(const OTransferInfo& info)
+{
+	// Found the file, download it next tick.
+	::dlstate.state = STATE_DOWNLOADING;
+	::dlstate.url = info.url;
+
+	PrintFmt("Found file at {}.\n", info.url);
+}
+
+/**
+ * @brief Called after a check bails out.
+ *
+ * @param msg Error message.
+ */
+static void CheckError(const char* msg)
+{
+	// That's a strike.
+	::dlstate.checkfails += 1;
+
+	::dlstate.check.reset();
+
+	// Three strikes and you're out.
+	if (::dlstate.checkfails >= 3)
+	{
+		PrintFmt(PRINT_WARNING, "Could not find {} at {} ({})...\n",
+		         ::dlstate.checkfilename,
+		         ::dlstate.checkurls.at(::dlstate.checkurlidx), msg);
+
+		// Check the next base URL.
+		::dlstate.checkfails = 0;
+		::dlstate.checkurlidx += 1;
+		if (::dlstate.checkurlidx >= ::dlstate.checkurls.size())
+		{
+			// No more base URL's to check - our luck has run out.
+			PrintFmt(PRINT_WARNING, "Download failed, no sites have {} for download.\n",
+			         ::dlstate.checkfilename);
+			::dlstate.Ready();
+		}
+	}
+}
+
+static void TickCheck()
+{
+	if (::dlstate.check == NULL)
+	{
+		// Start with our base URL.
+		std::string fullurl = ::dlstate.checkurls.at(::dlstate.checkurlidx);
+
+		// Try three different variants of the file.
+		::dlstate.checkfilename = ::dlstate.filename;
+		if (::dlstate.checkfails >= 2)
+		{
+			// Second strike, try all uppercase.
+			::dlstate.checkfilename = StdStringToUpper(::dlstate.checkfilename);
+		}
+		else if (::dlstate.checkfails == 1)
+		{
+			// First stirke, try all lowercase.
+			::dlstate.checkfilename = StdStringToLower(::dlstate.checkfilename);
+		}
+
+		// Create the check transfer.
+		::dlstate.check = std::make_unique<OTransferCheck>(CheckDone, CheckError);
+
+		std::string safeFileName =
+		    ::dlstate.check->escapeFileName(::dlstate.checkfilename);
+
+		// Now we have the full URL.
+		fullurl += safeFileName;
+
+		::dlstate.check->setURL(fullurl);
+		if (!::dlstate.check->start())
+		{
+			// Failed to start, bail out.
+			::dlstate.Ready();
+			return;
+		}
+
+		::dlstate.state = STATE_CHECKING;
+		PrintFmt("Checking for file at {}...\n", fullurl);
+	}
+
+	// Tick the checker - the done/error callbacks mutate the state appropriately,
+	// so we don't need to bother with the return value here.
+	::dlstate.check->tick();
+}
+
+/**
+ * @brief Construct a list of download directories.
+ */
+static StringTokens GetDownloadDirs()
+{
+	StringTokens dirs;
+
+	// Add all of the sources.
+	D_AddSearchDir(dirs, cl_waddownloaddir.str());
+	D_AddSearchDir(dirs, M_GetDownloadDir());
+
+	// These folders should only work on PC versions
+#ifndef GCONSOLE
+	D_AddSearchDirList(dirs, Args.CheckValue("-waddir"));
+	D_AddSearchDir(dirs, getenv("DOOMWADDIR"));
+	D_AddSearchDirList(dirs, getenv("DOOMWADPATH"));
+#endif
+
+	D_AddSearchDirList(dirs, waddirs.str());
+
+#ifdef __SWITCH__
+	D_AddSearchDir(dirs, "./wads");
+#endif
+
+	dirs.push_back(M_GetCWD());
+
+	// Clean up all of the directories before deduping them.
+	for (auto& dir : dirs)
+		dir = M_CleanPath(dir);
+
+	// Dedupe directories.
+	dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+	return dirs;
+}
+
+static void TransferDone(const OTransferInfo& info)
+{
+	std::string bytes;
+	StrFormatBytes(bytes, info.speed);
+	PrintFmt("Download completed at {}/s.\n", bytes);
+
+	if (::dlstate.flags & DL_RECONNECT)
+		CL_Reconnect();
+}
+
+static void TransferError(const char* msg)
+{
+	PrintFmt(PRINT_WARNING, "Download error ({}).\n", msg);
+}
+
+static void TickDownload()
+{
+	if (::dlstate.transfer == NULL)
+	{
+		// Create the transfer.
+		::dlstate.transfer = std::make_unique<OTransfer>(TransferDone, TransferError);
+		::dlstate.transfer->setURL(::dlstate.url);
+
+		// Figure out where our destination should be.
+		std::string dest;
+		StringTokens dirs = GetDownloadDirs();
+		for (const auto& dir : dirs)
+		{
+			// Ensure no path-traversal shenanegins are going on.
+			dest = dir + PATHSEP + ::dlstate.filename;
+			dest = M_CleanPath(dest);
+			if (dest.find(dir) != 0)
+			{
+				// Something about the filename is trying to escape the
+				// download directory.  This is almost certainly malicious.
+				TransferError("Saved file tried to escape download directory.\n");
+				::dlstate.Ready();
+				return;
+			}
+
+			// If the output file was set successfully, escape the loop.
+			int err = ::dlstate.transfer->setOutputFile(dest);
+			if (err == 0)
+				break;
+
+			// Otherwise, set the destination to the empty string and try again.
+			PrintFmt(PRINT_WARNING, "Could not save to {} ({})\n", dest, strerror(err));
+			dest = "";
+		}
+
+		if (dest.empty())
+		{
+			// Found no safe place to write, bail out.
+			TransferError("No safe place to save file.\n");
+			::dlstate.Ready();
+			return;
+		}
+
+		// Set our expected hash of the file.
+		::dlstate.transfer->setMD5(::dlstate.hash);
+
+		if (!::dlstate.transfer->start())
+		{
+			// Failed to start, bail out.
+			::dlstate.Ready();
+			return;
+		}
+
+		::dlstate.state = STATE_DOWNLOADING;
+		PrintFmt("Downloading {}...\n", ::dlstate.url);
+	}
+
+	if (!::dlstate.transfer->tick())
+	{
+		if (::dlstate.transfer->shouldCheckAgain())
+		{
+			// Check the next site.
+			::dlstate.state = STATE_CHECKING;
+			::dlstate.checkfails = 0;
+			::dlstate.checkurlidx += 1;
+			if (::dlstate.checkurlidx >= ::dlstate.checkurls.size())
+			{
+				// No more base URL's to check - our luck has run out.
+				PrintFmt(PRINT_WARNING, "Download failed, no sites have {} for download.\n",
+				         ::dlstate.checkfilename);
+				::dlstate.Ready();
+			}
+		}
+		else
+		{
+			// Either we are done or encountered an error that is indicitive
+			// of an issue that we can't hope to recover from.
+			::dlstate.Ready();
+		}
+	}
+}
+
+/**
+ * @brief Service the download per-tick.
+ */
+void CL_DownloadTick()
+{
+	switch (::dlstate.state)
+	{
+	case STATE_CHECKING:
+		::dlstate.transfer.reset();
+		TickCheck();
+		break;
+	case STATE_DOWNLOADING:
+		::dlstate.check.reset();
+		TickDownload();
+		break;
+	default:
+		::dlstate.check.reset();
+		::dlstate.transfer.reset();
+		return;
+	}
+}
+
+/**
+ * @brief Returns a transfer filename for use by the console.
+ *
+ * @return Filename being transferred.
+ */
+std::string CL_DownloadFilename()
+{
+	if (::dlstate.state != STATE_DOWNLOADING)
+		return std::string("");
+
+	if (::dlstate.transfer == NULL)
+		return std::string("");
+
+	return ::dlstate.transfer->getFilename();
+}
+
+/**
+ * @brief Returns a transfer progress object for use by the console.
+ *
+ * @return Progress object.
+ */
+OTransferProgress CL_DownloadProgress()
+{
+	if (::dlstate.state != STATE_DOWNLOADING)
+		return OTransferProgress();
+
+	if (::dlstate.transfer == NULL)
+		return OTransferProgress();
+
+	return ::dlstate.transfer->getProgress();
+}
+
+EXTERN_CVAR(cl_downloadsites)
+
+static void DownloadHelp()
+{
+	PrintFmt("download - Downloads a WAD file\n\n"
+	         "Usage:\n"
+	         "  ] download get <FILENAME>\n"
+	         "  Downloads the file FILENAME from your configured download sites.\n"
+	         "  ] download stop\n"
+	         "  Stop an in-progress download.");
+}
+
+BEGIN_COMMAND(download)
+{
+	if (argc < 2)
+	{
+		DownloadHelp();
+		return;
+	}
+
+	if (stricmp(argv[1], "get") == 0 && argc >= 3)
+	{
+		Websites clientsites = TokenizeString(cl_downloadsites.str(), " ");
+
+		// Shuffle the sites so we evenly distribute our requests.
+		std::shuffle(clientsites.begin(), clientsites.end(), rng);
+
+		// Attach the website to the file and download it.
+		OWantFile file;
+		OWantFile::make(file, argv[2], OFILE_UNKNOWN);
+		CL_StartDownload(clientsites, file, 0);
+		return;
+	}
+
+	if (stricmp(argv[1], "stop") == 0)
+	{
+		if (CL_StopDownload())
+			PrintFmt(PRINT_WARNING, "Download cancelled.\n");
+
+		return;
+	}
+
+	DownloadHelp();
+}
+END_COMMAND(download)
+
+#endif // __EMSCRIPTEN__
+
+VERSION_CONTROL(cl_download_cpp, "$Id: 6657822cd033e6dffd4a4a6dff5a6fb208d9078c $")

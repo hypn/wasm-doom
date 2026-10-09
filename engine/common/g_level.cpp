@@ -1,0 +1,1142 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: eeb5043b1e867bbc0ca1f46e5dd9cfbc1f058f63 $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Common level routines
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+
+#include <set>
+
+#include "c_console.h"
+#include "c_dispatch.h"
+#include "c_maplist.h"
+#include "d_event.h"
+#include "d_main.h"
+#include "g_game.h"
+#include "gi.h"
+#include "i_system.h"
+#include "p_acs.h"
+#include "p_local.h"
+#include "p_saveg.h"
+#include "p_unlag.h"
+#include "r_data.h"
+#include "r_sky.h"
+#include "v_video.h"
+#include "w_wad.h"
+#include "w_ident.h"
+
+level_locals_t level;			// info about current level
+maplist_lastmaps_t forcedlastmaps;		// forced last map for the current wad
+
+level_pwad_info_t g_EmptyLevel;
+cluster_info_t g_EmptyCluster;
+
+EXTERN_CVAR(co_allowdropoff)
+EXTERN_CVAR(co_realactorheight)
+
+//
+// LevelInfos methods
+//
+
+// Construct from array of levelinfos, ending with an "empty" level
+LevelInfos::LevelInfos(const level_info_t* levels) :
+	m_defaultInfos(levels)
+{
+	//addDefaults();
+}
+
+// Destructor frees everything in the class
+LevelInfos::~LevelInfos()
+{
+	clear();
+}
+
+// Add default level infos
+void LevelInfos::addDefaults()
+{
+	for (size_t i = 0;; i++)
+	{
+		const level_info_t& level = m_defaultInfos[i];
+		if (!level.exists())
+			break;
+
+		// Copied, so it can be mutated.
+		level_pwad_info_t info(level);
+		m_infos.push_back(info);
+	}
+}
+
+// Get a specific info index
+level_pwad_info_t& LevelInfos::at(size_t i)
+{
+	return m_infos.at(i);
+}
+
+// Clear all cluster definitions
+void LevelInfos::clear()
+{
+	clearSnapshots();
+	zapDeferreds();
+	m_infos.clear();
+}
+
+// Clear all stored snapshots
+void LevelInfos::clearSnapshots()
+{
+	for (auto& info : m_infos)
+	{
+		if (info.snapshot)
+		{
+			delete info.snapshot;
+			info.snapshot = nullptr;
+		}
+	}
+}
+
+// Add a new levelinfo and return it by reference
+level_pwad_info_t& LevelInfos::create()
+{
+	return m_infos.emplace_back();
+}
+
+// Find a levelinfo by mapname
+level_pwad_info_t& LevelInfos::findByName(const char* mapname)
+{
+	for (auto& info : m_infos)
+	{
+		if (info.mapname == mapname)
+		{
+			return info;
+		}
+	}
+	return ::g_EmptyLevel;
+}
+
+level_pwad_info_t& LevelInfos::findByName(const std::string &mapname)
+{
+	for (auto& info : m_infos)
+	{
+		if (info.mapname == mapname)
+		{
+			return info;
+		}
+	}
+	return ::g_EmptyLevel;
+}
+
+level_pwad_info_t& LevelInfos::findByName(const OLumpName& mapname)
+{
+	for (auto& info : m_infos)
+	{
+		if (info.mapname == mapname)
+		{
+			return info;
+		}
+	}
+	return ::g_EmptyLevel;
+}
+
+// Find a levelinfo by mapnum
+level_pwad_info_t& LevelInfos::findByNum(int levelnum)
+{
+	for (auto& info : m_infos)
+	{
+		if (info.levelnum == levelnum && W_CheckNumForName(info.mapname) != -1)
+		{
+			return info;
+		}
+	}
+	return ::g_EmptyLevel;
+}
+
+// Number of info entries.
+size_t LevelInfos::size()
+{
+	return m_infos.size();
+}
+
+// Zap all deferred ACS scripts
+void LevelInfos::zapDeferreds()
+{
+	for (auto& info : m_infos)
+	{
+		acsdefered_t* def = info.defered;
+		while (def) {
+			acsdefered_t* next = def->next;
+			delete def;
+			def = next;
+		}
+		info.defered = nullptr;
+	}
+}
+
+//
+// ClusterInfos methods
+//
+
+// Construct from array of clusterinfos, ending with an "empty" cluster.
+ClusterInfos::ClusterInfos(const cluster_info_t* clusters) :
+	m_defaultInfos(clusters)
+{
+	//addDefaults();
+}
+
+// Destructor frees everything in the class
+ClusterInfos::~ClusterInfos()
+{
+	clear();
+}
+
+// Add default level infos
+void ClusterInfos::addDefaults()
+{
+	for (size_t i = 0;; i++)
+	{
+		const cluster_info_t& cluster = m_defaultInfos[i];
+		if (cluster.cluster == 0)
+		{
+			break;
+		}
+
+		// Copied, so it can be mutated.
+		m_infos.push_back(cluster);
+	}
+}
+
+// Get a specific info index
+cluster_info_t& ClusterInfos::at(size_t i)
+{
+	return m_infos.at(i);
+}
+
+// Clear all cluster definitions
+void ClusterInfos::clear()
+{
+	m_infos.clear();
+}
+
+// Add a new levelinfo and return it by reference
+cluster_info_t& ClusterInfos::create()
+{
+	return m_infos.emplace_back();
+}
+
+// Find a clusterinfo by mapname
+cluster_info_t& ClusterInfos::findByCluster(int i)
+{
+	for (auto& info : m_infos)
+	{
+		if (info.cluster == i)
+		{
+			return info;
+		}
+	}
+	return ::g_EmptyCluster;
+}
+
+// Number of info entries.
+size_t ClusterInfos::size() const
+{
+	return m_infos.size();
+}
+
+void P_RemoveDefereds()
+{
+	::getLevelInfos().zapDeferreds();
+}
+
+//
+// G_LoadWad
+//
+// Determines if the vectors of wad & patch filenames differs from the currently
+// loaded ones and calls D_DoomWadReboot if so.
+//
+bool G_LoadWad(const OWantFiles& newwadfiles, const OWantFiles& newpatchfiles,
+               const std::string& mapname)
+{
+	bool AddedIWAD = false;
+	bool Reboot = false;
+
+	// Did we pass an IWAD?
+	if (!newwadfiles.empty() && W_IsKnownIWAD(newwadfiles[0]))
+	{
+		AddedIWAD = true;
+	}
+
+	// Check our environment, if the same WADs are used, ignore this command.
+
+	// Did we switch IWAD files?
+	if (AddedIWAD && !::wadfiles.empty())
+	{
+		if (newwadfiles.at(0).getBasename() != wadfiles.at(1).getBasename())
+		{
+			Reboot = true;
+		}
+	}
+
+	// Do the sizes of the WAD lists not match up?
+	if (!Reboot)
+	{
+		if (::wadfiles.size() - 2 != newwadfiles.size() - (AddedIWAD ? 1 : 0))
+		{
+			Reboot = true;
+		}
+	}
+
+	// Do our WAD lists match up exactly?
+	if (!Reboot)
+	{
+		for (size_t i = 2, j = (AddedIWAD ? 1 : 0);
+		     i < ::wadfiles.size() && j < newwadfiles.size(); i++, j++)
+		{
+			if (!(newwadfiles.at(j).getBasename() == ::wadfiles.at(i).getBasename()))
+			{
+				Reboot = true;
+				break;
+			}
+		}
+	}
+
+	// Do the sizes of the patch lists not match up?
+	if (!Reboot)
+	{
+		if (patchfiles.size() != newpatchfiles.size())
+		{
+			Reboot = true;
+		}
+	}
+
+	// Do our patchfile lists match up exactly?
+	if (!Reboot)
+	{
+		for (size_t i = 0, j = 0; i < ::patchfiles.size() && j < newpatchfiles.size();
+		     i++, j++)
+		{
+			if (!(newpatchfiles.at(j).getBasename() == ::patchfiles.at(i).getBasename()))
+			{
+				Reboot = true;
+				break;
+			}
+		}
+	}
+
+	if (Reboot)
+	{
+		unnatural_level_progression = true;
+
+		// [SL] Stop any playing/recording demos before D_DoomWadReboot wipes out
+		// the zone memory heap and takes the demo data with it.
+#ifdef CLIENT_APP
+		{
+			G_CheckDemoStatus();
+		}
+#endif
+		D_DoomWadReboot(newwadfiles, newpatchfiles);
+		if (!missingfiles.empty())
+		{
+			G_DeferedInitNew(startmap);
+			return false;
+		}
+	}
+
+	if (mapname.length())
+	{
+		if (W_CheckNumForName(mapname) != -1)
+		{
+			G_DeferedInitNew(mapname);
+		}
+        else
+        {
+            PrintFmt_Bold("map {} not found, loading start map instead", mapname);
+			G_DeferedInitNew(startmap);
+        }
+	}
+	else
+		G_DeferedInitNew(startmap);
+
+	return true;
+}
+
+//
+// G_LoadWadString
+//
+// Takes a string of random wads and patches, which is sorted through and
+// trampolined to the implementation of G_LoadWad.
+//
+bool G_LoadWadString(const std::string& str, const std::string& mapname, const maplist_lastmaps_t& lastmaps)
+{
+	const std::vector<std::string>& wad_exts = M_FileTypeExts(OFILE_WAD);
+	const std::vector<std::string>& deh_exts = M_FileTypeExts(OFILE_DEH);
+
+	OWantFiles newwadfiles;
+	OWantFiles newpatchfiles;
+
+	auto parser = ParseString(str, false);
+	while(std::optional<std::string> token = parser().token)
+	{
+		OWantFile file;
+		if (!OWantFile::make(file, *token, OFILE_UNKNOWN))
+		{
+			PrintFmt(PRINT_WARNING, "Could not parse \"{}\" into file, skipping...\n",
+			         *token);
+			continue;
+		}
+
+		// Does this look like a DeHackEd patch?
+		bool is_deh =
+		    std::find(deh_exts.begin(), deh_exts.end(), StdStringToUpper(file.getExt())) != deh_exts.end();
+		if (is_deh)
+		{
+			if (!OWantFile::make(file, *token, OFILE_DEH))
+			{
+				PrintFmt(PRINT_WARNING,
+				         "Could not parse \"{}\" into patch file, skipping...\n",
+				         *token);
+				continue;
+			}
+
+			newpatchfiles.push_back(file);
+			continue;
+		}
+
+		// Does this look like a WAD file?
+		bool is_wad =
+		    std::find(wad_exts.begin(), wad_exts.end(), StdStringToUpper(file.getExt())) != wad_exts.end();
+		if (is_wad)
+		{
+			if (!OWantFile::make(file, *token, OFILE_WAD))
+			{
+				PrintFmt(PRINT_WARNING,
+				         "Could not parse \"{}\" into WAD file, skipping...\n",
+				         *token);
+				continue;
+			}
+
+			newwadfiles.push_back(file);
+			continue;
+		}
+
+		// Just push the unknown file into the resource list.
+		newwadfiles.push_back(file);
+		continue;
+	}
+
+	forcedlastmaps = lastmaps;
+	return G_LoadWad(newwadfiles, newpatchfiles, mapname);
+}
+
+
+BEGIN_COMMAND (map)
+{
+	if (argc > 1)
+	{
+		OLumpName mapname;
+
+		// [Dash|RD] -- We can make a safe assumption that the user might not specify
+		//              the whole lumpname for the level, and might opt for just the
+		//              number. This makes sense, so why isn't there any code for it?
+		if (W_CheckNumForName (argv[1]) == -1 && isdigit(argv[1][0]))
+		{ // The map name isn't valid, so lets try to make some assumptions for the user.
+
+			// If argc is 2, we assume Doom 2/Final Doom. If it's 3, Ultimate Doom.
+            // [Russell] - gamemode is always the better option compared to above
+			if ( argc == 2 )
+			{
+				if ((gameinfo.flags & GI_MAPxx))
+                    mapname = fmt::format("MAP{:02d}", atoi( argv[1] ) );
+                else
+                    mapname = fmt::format("E{}M{}", argv[1][0], argv[1][1]);
+
+			}
+
+			if (W_CheckNumForName (mapname) == -1)
+			{ // Still no luck, oh well.
+				PrintFmt(PRINT_WARNING, "Map {} not found.\n", argv[1]);
+			}
+			else
+			{ // Success
+				unnatural_level_progression = true;
+				G_DeferedInitNew(mapname);
+			}
+
+		}
+		else
+		{
+			// Ch0wW - Map was still not found, so don't bother trying loading the map.
+			if (W_CheckNumForName (argv[1]) == -1)
+			{
+				PrintFmt(PRINT_WARNING, "Map {} not found.\n", argv[1]);
+			}
+			else
+			{
+				unnatural_level_progression = true;
+				mapname = argv[1];
+				G_DeferedInitNew(mapname);
+			}
+		}
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "The current map is {}: \"{}\"\n", level.mapname, level.level_name);
+	}
+}
+END_COMMAND (map)
+
+OLumpName CalcMapName(int episode, int level)
+{
+	if (gameinfo.flags & GI_MAPxx)
+	{
+		return fmt::format("MAP{:02d}", level);
+	}
+	else
+	{
+		return fmt::format("E{}M{}", episode, level);
+	}
+}
+
+void G_AirControlChanged()
+{
+	if (level.aircontrol <= 256)
+	{
+		level.airfriction = FRACUNIT;
+	}
+	else
+	{
+		// Friction is inversely proportional to the amount of control
+		float fric = ((float)level.aircontrol/65536.f) * -0.0941f + 1.0004f;
+		level.airfriction = (fixed_t)(fric * 65536.f);
+	}
+}
+
+// Serialize or unserialize the state of the level depending on the state of
+// the first parameter.  Second parameter is true if you need to deal with hub
+// playerstate.  Third parameter is true if you want to handle playerstate
+// yourself (map resets), just make sure you set it the same for both
+// serialization and unserialization.
+void G_SerializeLevel(FArchive &arc, bool hubLoad)
+{
+	const byte freecamplayer_id = 255;
+	player_t *p = &idplayer(freecamplayer_id);
+
+	if (arc.IsStoring ())
+	{
+		// note never serialize the freecam player
+		unsigned int playernum = p->isFreecam ? players.size() - 1 : players.size();
+		arc << level.flags
+			<< level.flags2
+			<< level.fadeto_color[0] << level.fadeto_color[1] << level.fadeto_color[2] << level.fadeto_color[3]
+			<< level.found_secrets
+			<< level.found_items
+			<< level.killed_monsters
+			<< level.gravity
+			<< level.aircontrol;
+
+		G_AirControlChanged();
+
+		for (const auto& var : level.vars)
+			arc << var;
+
+		if (!arc.IsReset())
+			arc << playernum;
+	}
+	else
+	{
+		arc >> level.flags
+			>> level.flags2
+			>> level.fadeto_color[0] >> level.fadeto_color[1] >> level.fadeto_color[2] >> level.fadeto_color[3]
+			>> level.found_secrets
+			>> level.found_items
+			>> level.killed_monsters
+			>> level.gravity
+			>> level.aircontrol;
+
+		G_AirControlChanged();
+
+		for (auto& var : level.vars)
+			arc >> var;
+
+		if (!arc.IsReset())
+		{
+			unsigned int playernum;
+			arc >> playernum;
+			players.resize(playernum);
+		}
+	}
+
+	if (!hubLoad && !arc.IsReset())
+		P_SerializePlayers(arc);
+
+	P_SerializeThinkers(arc, hubLoad);
+	P_SerializeWorld(arc);
+	P_SerializePolyobjs(arc);
+	P_SerializeSounds(arc);
+}
+
+// Archives the current level
+void G_SnapshotLevel()
+{
+	delete level.info->snapshot;
+
+	level.info->snapshot = new FLZOMemFile;
+	level.info->snapshot->Open();
+
+	FArchive arc(*level.info->snapshot);
+
+	G_SerializeLevel(arc, false);
+}
+
+// Unarchives the current level based on its snapshot
+// The level should have already been loaded and setup.
+void G_UnSnapshotLevel(bool hubLoad)
+{
+	if (level.info->snapshot == NULL)
+		return;
+
+	level.info->snapshot->Reopen ();
+	FArchive arc (*level.info->snapshot);
+	if (hubLoad)
+		arc.SetHubTravel (); // denis - hexen?
+	G_SerializeLevel(arc, hubLoad);
+	arc.Close ();
+	// No reason to keep the snapshot around once the level's been entered.
+	delete level.info->snapshot;
+	level.info->snapshot = NULL;
+}
+
+void G_ClearSnapshots()
+{
+	getLevelInfos().clearSnapshots();
+}
+
+static void writeSnapShot(FArchive &arc, level_pwad_info_t& info)
+{
+	arc.Write(info.mapname.c_str(), 8);
+	info.snapshot->Serialize(arc);
+}
+
+void G_SerializeSnapshots(FArchive &arc)
+{
+	LevelInfos& levels = getLevelInfos();
+
+	if (arc.IsStoring())
+	{
+		for (size_t i = 0; i < levels.size(); i++)
+		{
+			level_pwad_info_t& level = levels.at(i);
+			if (level.snapshot)
+			{
+				writeSnapShot(arc, level);
+			}
+		}
+
+		// Signal end of snapshots
+		arc << static_cast<char>(0);
+	}
+	else
+	{
+		LevelInfos& levels = getLevelInfos();
+		char mapname[8];
+
+		G_ClearSnapshots ();
+
+		arc >> mapname[0];
+		while (mapname[0])
+		{
+			arc.Read(&mapname[1], 7);
+
+			// FIXME: We should really serialize the full levelinfo
+			level_pwad_info_t& info = levels.findByName(mapname);
+			info.snapshot = new FLZOMemFile;
+			info.snapshot->Serialize(arc);
+			arc >> mapname[0];
+		}
+	}
+}
+
+static void writeDefereds(FArchive &arc, level_pwad_info_t& info)
+{
+	arc.Write(info.mapname.c_str(), 8);
+	arc << info.defered;
+}
+
+void P_SerializeACSDefereds(FArchive &arc)
+{
+	LevelInfos& levels = getLevelInfos();
+
+	if (arc.IsStoring())
+	{
+		for (size_t i = 0; i < levels.size(); i++)
+		{
+			level_pwad_info_t& level = levels.at(i);
+			if (level.defered)
+			{
+				writeDefereds(arc, level);
+			}
+		}
+
+		// Signal end of defereds
+		arc << (byte)0;
+	}
+	else
+	{
+		LevelInfos& levels = getLevelInfos();
+		char mapname[8];
+
+		P_RemoveDefereds();
+
+		arc >> mapname[0];
+		while (mapname[0])
+		{
+			arc.Read(&mapname[1], 7);
+			level_pwad_info_t& info = levels.findByName(mapname);
+			if (!info.exists())
+			{
+				char name[9];
+				strncpy(name, mapname, ARRAY_LENGTH(name) - 1);
+				name[8] = 0;
+				I_Error("Unknown map '{}' in savegame", name);
+			}
+			arc >> info.defered;
+			arc >> mapname[0];
+		}
+	}
+}
+
+static int startpos;	// [RH] Support for multiple starts per level
+
+void G_DoWorldDone()
+{
+	gamestate = GS_LEVEL;
+	if (wminfo.next[0] == 0)
+	{
+		// Don't die if no next map is given,
+		// just repeat the current one.
+		PrintFmt(PRINT_WARNING, "No next map specified.\n");
+	}
+	else
+	{
+		level.mapname = wminfo.next;
+	}
+	G_DoLoadLevel (startpos);
+	startpos = 0;
+	gameaction = ga_nothing;
+	viewactive = true;
+}
+
+
+extern dyncolormap_t NormalLight;
+
+EXTERN_CVAR (sv_gravity)
+EXTERN_CVAR (sv_aircontrol)
+EXTERN_CVAR (sv_allowjump)
+EXTERN_CVAR (sv_freelook)
+
+void G_InitLevelLocals()
+{
+	const std::array<byte, 4> old_fadeto_color = level.fadeto_color;
+
+	R_ExitLevel();
+
+	NormalLight.maps = shaderef_t(&realcolormaps, 0);
+	//NormalLight.maps = shaderef_t(&DefaultPalette->maps, 0);
+
+	level.gravity = sv_gravity;
+	level.aircontrol = static_cast<fixed_t>(sv_aircontrol * 65536.f);
+	G_AirControlChanged();
+
+	// clear all ACS variables
+	level.vars.fill(0);
+
+	// Get our canonical level data.
+	level_pwad_info_t& info = getLevelInfos().findByName(::level.mapname);
+
+	// [ML] 5/11/06 - Remove sky scrolling and sky2
+	// [SL] 2012-03-19 - Add sky2 back
+	::level.info = (level_info_t*)&info;
+	::level.skypic2 = info.skypic2;
+	::level.fadeto_color = info.fadeto_color;
+
+	if (::level.fadeto_color[0] || ::level.fadeto_color[1] || ::level.fadeto_color[2] || ::level.fadeto_color[3])
+	{
+		NormalLight.maps = shaderef_t(&V_GetDefaultPalette()->maps, 0);
+	}
+	else
+	{
+		R_ForceDefaultColormap(info.fadetable.c_str());
+	}
+
+	::level.outsidefog_color = info.outsidefog_color;
+
+	::level.flags |= LEVEL_DEFINEDINMAPINFO;
+	if (info.gravity != 0.f)
+	{
+		::level.gravity = info.gravity;
+	}
+	if (info.aircontrol != 0.f)
+	{
+		::level.aircontrol = static_cast<fixed_t>(info.aircontrol * 65536.f);
+	}
+	::level.airsupply = info.airsupply;
+
+	::level.partime = info.partime;
+	::level.cluster = info.cluster;
+	::level.flags = info.flags;
+	::level.flags2 = info.flags2;
+	::level.levelnum = info.levelnum;
+	::level.level_fingerprint = info.level_fingerprint;
+
+	// Only copy the level name if there's a valid level name to be copied.
+
+	if (!info.level_name.empty())
+	{
+		// Get rid of initial lump name or level number.
+		std::string begin;
+		if (info.mapname[0] == 'E' && info.mapname[2] == 'M')
+		{
+			std::string search;
+			search = fmt::sprintf("E%cM%c: ", info.mapname[1], info.mapname[3]);
+
+			const std::size_t pos = info.level_name.find(search);
+
+			if (pos != std::string::npos)
+				begin = info.level_name.substr(pos + search.length());
+			else
+				begin = info.level_name;
+		}
+		else if (strstr(info.mapname.c_str(), "MAP") == &info.mapname[0])
+		{
+			std::string search;
+			search = fmt::sprintf("%u: ", info.levelnum);
+
+			const std::size_t pos = info.level_name.find(search);
+
+			if (pos != std::string::npos)
+				begin = info.level_name.substr(pos + search.length());
+			else
+				begin = info.level_name;
+		}
+		else
+		{
+			begin = info.level_name;
+		}
+
+
+		if (!begin.empty())
+		{
+			std::string level_name(begin);
+			TrimString(level_name);
+			strncpy(::level.level_name, level_name.c_str(),
+			        ARRAY_LENGTH(::level.level_name) - 1);
+		}
+		else
+		{
+			strncpy(::level.level_name, "Untitled Level",
+			        ARRAY_LENGTH(::level.level_name) - 1);
+		}
+	}
+	else
+	{
+		strncpy(::level.level_name, "Untitled Level",
+		        ARRAY_LENGTH(::level.level_name) - 1);
+	}
+
+	::level.nextmap = info.nextmap;
+	::level.secretmap = info.secretmap;
+	::level.music = info.music;
+	::level.skypic = info.skypic;
+	if (::level.skypic2.empty())
+	{
+		::level.skypic2 = ::level.skypic;
+	}
+	::level.sky1ScrollDelta = info.sky1ScrollDelta;
+	::level.sky2ScrollDelta = info.sky2ScrollDelta;
+
+	if (::level.flags & LEVEL_JUMP_YES)
+	{
+		sv_allowjump = 1;
+	}
+	if (::level.flags & LEVEL_JUMP_NO)
+	{
+		sv_allowjump = 0.0;
+	}
+	if (::level.flags & LEVEL_FREELOOK_YES)
+	{
+		sv_freelook = 1;
+	}
+	if (::level.flags & LEVEL_FREELOOK_NO)
+	{
+		sv_freelook = 0.0;
+	}
+
+//	memset (level.vars, 0, sizeof(level.vars));
+
+	if (::level.fadeto_color != old_fadeto_color)
+	{
+		V_RefreshColormaps();
+	}
+
+	::level.exitpic = info.exitpic;
+	::level.exitscript = info.exitscript;
+	::level.exitanim = info.exitanim;
+	::level.enterpic = info.enterpic;
+	::level.enterscript = info.enterscript;
+	::level.enteranim = info.enteranim;
+	::level.endpic = info.endpic;
+
+	::level.intertext = info.intertext;
+	::level.intertextsecret = info.intertextsecret;
+	::level.interbackdrop = info.interbackdrop;
+	::level.intermusic = info.intermusic;
+	::level.zintermusic = info.zintermusic;
+
+	::level.bossactions = info.bossactions;
+	::level.label = info.label;
+	::level.clearlabel = info.clearlabel;
+	::level.author = info.author;
+
+	::level.musinfo_map = info.musinfo_map;
+
+	::level.detected_gametype = GM_COOP;
+
+	movingsectors.clear();
+}
+
+static void MapinfoHelp()
+{
+	PrintFmt(PRINT_HIGH,
+		"mapinfo - Looks up internal information about levels\n\n"
+		"Usage:\n"
+		"  ] mapinfo mapname <LUMPNAME>\n"
+		"  Looks up a map contained in the lump LUMPNAME.\n\n"
+		"  ] mapinfo levelnum <LEVELNUM>\n"
+		"  Looks up a map with a levelnum of LEVELNUM.\n\n"
+		"  ] mapinfo at <LEVELINFO ID>\n"
+		"  Looks up a map based on its placement in the internal level info array.\n\n"
+		"  ] mapinfo size\n"
+		"  Return the size of the internal level info array.\n");
+}
+
+// A debugging tool to examine the state of computed map data.
+BEGIN_COMMAND(mapinfo)
+{
+	if (argc < 2)
+	{
+		MapinfoHelp();
+		return;
+	}
+
+	LevelInfos& levels = getLevelInfos();
+	if (stricmp(argv[1], "size") == 0)
+	{
+		PrintFmt(PRINT_HIGH, "{} maps found\n", levels.size());
+		return;
+	}
+
+	if (argc < 3)
+	{
+		MapinfoHelp();
+		return;
+	}
+
+	level_pwad_info_t* infoptr = NULL;
+	if (stricmp(argv[1], "mapname") == 0)
+	{
+		infoptr = &levels.findByName(argv[2]);
+		if (!infoptr->exists())
+		{
+			PrintFmt(PRINT_HIGH, "Map \"{}\" not found\n", argv[2]);
+			return;
+		}
+	}
+	else if (stricmp(argv[1], "levelnum") == 0)
+	{
+		int levelnum = atoi(argv[2]);
+		infoptr = &levels.findByNum(levelnum);
+		if (!infoptr->exists())
+		{
+			PrintFmt(PRINT_HIGH, "Map number {} not found\n", levelnum);
+			return;
+		}
+	}
+	else if (stricmp(argv[1], "at") == 0)
+	{
+		// Check ahead of time, otherwise we might crash.
+		int id = atoi(argv[2]);
+		if (id < 0 || id >= static_cast<int>(levels.size()))
+		{
+			PrintFmt(PRINT_HIGH, "Map index {} does not exist\n", id);
+			return;
+		}
+		infoptr = &levels.at(id);
+	}
+	else
+	{
+		MapinfoHelp();
+		return;
+	}
+
+	level_pwad_info_t& info = *infoptr;
+
+	PrintFmt(PRINT_HIGH, "Map Name: {}\n", info.mapname);
+	PrintFmt(PRINT_HIGH, "Level Number: {}\n", info.levelnum);
+	PrintFmt(PRINT_HIGH, "Level Name: {}\n", info.level_name);
+	PrintFmt(PRINT_HIGH, "Intermission Graphic: {}\n", info.pname);
+	PrintFmt(PRINT_HIGH, "Next Map: {}\n", info.nextmap);
+	PrintFmt(PRINT_HIGH, "Secret Map: {}\n", info.secretmap);
+	PrintFmt(PRINT_HIGH, "Par Time: {}\n", info.partime);
+	PrintFmt(PRINT_HIGH, "Sky: {}\n", info.skypic);
+	PrintFmt(PRINT_HIGH, "Music: {}\n", info.music);
+
+	// Stringify the set level flags.
+	std::string flags;
+	flags += (info.flags & LEVEL_NOINTERMISSION ? " NOINTERMISSION" : "");
+	flags += (info.flags & LEVEL_DOUBLESKY ? " DOUBLESKY" : "");
+	flags += (info.flags & LEVEL_NOSOUNDCLIPPING ? " NOSOUNDCLIPPING" : "");
+	flags += (info.flags & LEVEL_MAP07SPECIAL ? " MAP07SPECIAL" : "");
+	flags += (info.flags & LEVEL_BRUISERSPECIAL ? " BRUISERSPECIAL" : "");
+	flags += (info.flags & LEVEL_CYBORGSPECIAL ? " CYBORGSPECIAL" : "");
+	flags += (info.flags & LEVEL_SPIDERSPECIAL ? " SPIDERSPECIAL" : "");
+	flags += (info.flags & LEVEL_SPECLOWERFLOOR ? " SPECLOWERFLOOR" : "");
+	flags += (info.flags & LEVEL_SPECOPENDOOR ? " SPECOPENDOOR" : "");
+	flags += (info.flags & LEVEL_SPECACTIONSMASK ? " SPECACTIONSMASK" : "");
+	flags += (info.flags & LEVEL_MONSTERSTELEFRAG ? " MONSTERSTELEFRAG" : "");
+	flags += (info.flags & LEVEL_EVENLIGHTING ? " EVENLIGHTING" : "");
+	flags += (info.flags & LEVEL_SNDSEQTOTALCTRL ? " SNDSEQTOTALCTRL" : "");
+	flags += (info.flags & LEVEL_FORCENOSKYSTRETCH ? " FORCENOSKYSTRETCH" : "");
+	flags += (info.flags & LEVEL_JUMP_NO ? " JUMP_NO" : "");
+	flags += (info.flags & LEVEL_JUMP_YES ? " JUMP_YES" : "");
+	flags += (info.flags & LEVEL_FREELOOK_NO ? " FREELOOK_NO" : "");
+	flags += (info.flags & LEVEL_FREELOOK_YES ? " FREELOOK_YES" : "");
+	flags += (info.flags & LEVEL_STARTLIGHTNING ? " STARTLIGHTNING" : "");
+	flags += (info.flags & LEVEL_FILTERSTARTS ? " FILTERSTARTS" : "");
+	flags += (info.flags & LEVEL_LOBBYSPECIAL ? " LOBBYSPECIAL" : "");
+	flags += (info.flags & LEVEL_USEPLAYERSTARTZ ? " USEPLAYERSTARTZ" : "");
+	flags += (info.flags & LEVEL_DEFINEDINMAPINFO ? " DEFINEDINMAPINFO" : "");
+	flags += (info.flags & LEVEL_CHANGEMAPCHEAT ? " CHANGEMAPCHEAT" : "");
+	flags += (info.flags & LEVEL_VISITED ? " VISITED" : "");
+	flags += (info.flags & LEVEL_COMPAT_DROPOFF ? " COMPAT_DROPOFF" : "");
+	flags += (info.flags2 & LEVEL2_COMPAT_CROSSDROPOFF ? " COMPAT_CROSSDROPOFF" : "");
+	flags += (info.flags & LEVEL_COMPAT_NOPASSOVER ? " COMPAT_NOPASSOVER" : "");
+	flags += (info.flags & LEVEL_COMPAT_LIMITPAIN ? " COMPAT_LIMITPAIN" : "");
+	flags += (info.flags & LEVEL_COMPAT_SHORTTEX ? " COMPAT_SHORTTEX" : "");
+	flags += (info.flags2 & LEVEL2_NOINFIGHTING ? " NOINFIGHTING" : "");
+	flags += (info.flags2 & LEVEL2_NORMALINFIGHTING ? " NORMALINFIGHTING" : "");
+	flags += (info.flags2 & LEVEL2_TOTALINFIGHTING ? " TOTALINFIGHTING" : "");
+
+	if (flags.length() > 0)
+	{
+		PrintFmt(PRINT_HIGH, "Flags:{}\n", flags);
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "Flags: None\n");
+	}
+
+	PrintFmt(PRINT_HIGH, "Cluster: {}\n", info.cluster);
+	PrintFmt(PRINT_HIGH, "Snapshot? {}\n", info.snapshot ? "Yes" : "No");
+	PrintFmt(PRINT_HIGH, "ACS defereds? {}\n", info.defered ? "Yes" : "No");
+}
+END_COMMAND(mapinfo)
+
+// A debugging tool to examine the state of computed cluster data.
+BEGIN_COMMAND(clusterinfo)
+{
+	if (argc < 2)
+	{
+		PrintFmt(PRINT_HIGH, "Usage: clusterinfo <cluster id>\n");
+		return;
+	}
+
+	cluster_info_t& info = getClusterInfos().findByCluster(std::atoi(argv[1]));
+	if (info.cluster == 0)
+	{
+		PrintFmt(PRINT_HIGH, "Cluster {} not found\n", argv[1]);
+		return;
+	}
+
+	PrintFmt(PRINT_HIGH, "Cluster: {}\n", info.cluster);
+	PrintFmt(PRINT_HIGH, "Message Music: {}\n", info.messagemusic);
+	PrintFmt(PRINT_HIGH, "Message Flat: {}\n", info.finaleflat);
+	if (!info.exittext.empty())
+	{
+		PrintFmt(PRINT_HIGH, "- = Exit Text = -\n{}\n- = = = -\n", info.exittext);
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "Exit Text: None\n");
+	}
+	if (!info.entertext.empty())
+	{
+		PrintFmt(PRINT_HIGH, "- = Enter Text = -\n{}\n- = = = -\n", info.entertext);
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "Enter Text: None\n");
+	}
+
+	// Stringify the set cluster flags.
+	std::string flags;
+	flags += (info.flags & CLUSTER_HUB ? " HUB" : "");
+	flags += (info.flags & CLUSTER_EXITTEXTISLUMP ? " EXITTEXTISLUMP" : "");
+
+	if (flags.length() > 0)
+	{
+		PrintFmt(PRINT_HIGH, "Flags:{}\n", flags);
+	}
+	else
+	{
+		PrintFmt(PRINT_HIGH, "Flags: None\n");
+	}
+}
+END_COMMAND(clusterinfo)
+
+// Get global canonical levelinfo
+LevelInfos& getLevelInfos()
+{
+	static LevelInfos li(NULL);
+	return li;
+}
+
+// Get global canonical clusterinfo
+ClusterInfos& getClusterInfos()
+{
+	static ClusterInfos ci(NULL);
+	return ci;
+}
+
+// P_AllowDropOff()
+bool P_AllowDropOff()
+{
+	return co_allowdropoff && !(level.flags & LEVEL2_COMPAT_CROSSDROPOFF);
+}
+
+bool P_AllowPassover()
+{
+	if (level.flags & LEVEL_COMPAT_NOPASSOVER)
+		return false;
+
+	return co_realactorheight;
+}
+
+VERSION_CONTROL (g_level_cpp, "$Id: eeb5043b1e867bbc0ca1f46e5dd9cfbc1f058f63 $")

@@ -1,0 +1,101 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 86022a82ee008b1749e729519b6f9bfb31c5e449 $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//   A better text lump parser, with no global state.
+//
+//-----------------------------------------------------------------------------
+
+#pragma once
+
+#include "i_system.h"
+
+struct OScannerConfig
+{
+	OLumpName lumpName;
+	bool semiComments = false;
+	bool cComments    = false;
+	bool hashComments = false;
+};
+
+class OScanner
+{
+	OScannerConfig m_config;
+	const char* m_scriptStart;
+	const char* m_scriptEnd;
+	const char* m_position;
+	int m_lineNumber;
+	std::string m_token;
+	bool m_unScan;
+	bool m_removeEscapeCharacter;
+	bool m_isQuotedString;
+	bool m_crossed;
+
+	bool checkPair(char a, char b);
+	void skipWhitespace();
+	void skipToNextLine();
+	void skipPastPair(char a, char b);
+	bool munchQuotedString();
+	void munchString();
+	void pushToken(const char* string, size_t length);
+	void pushToken(const std::string& string);
+
+  public:
+	OScanner(const OScannerConfig& config)
+	    : m_config(config), m_scriptStart(NULL), m_scriptEnd(NULL), m_position(NULL),
+	      m_lineNumber(0), m_token(""), m_unScan(false), m_removeEscapeCharacter(false),
+	      m_isQuotedString(false), m_crossed(false)
+	{
+	}
+
+	static OScanner openBuffer(const OScannerConfig& config, const char* start,
+	                           const char* end);
+
+	bool scan();
+	void mustScan(size_t max_length = 0);
+	void mustScanInt();
+	void mustScanFloat();
+	void mustScanBool();
+	void unScan();
+
+	[[nodiscard]] std::string getToken() const;
+	[[nodiscard]] int getTokenInt() const;
+	[[nodiscard]] float getTokenFloat() const;
+	[[nodiscard]] bool getTokenBool() const;
+
+	bool &crossed();
+	[[nodiscard]] bool isQuotedString() const;
+	[[nodiscard]] bool isIdentifier() const;
+	void assertTokenIs(std::string_view string) const;
+	void assertTokenNoCaseIs(std::string_view string) const;
+	[[nodiscard]] bool compareToken(std::string_view string) const;
+	[[nodiscard]] bool compareTokenNoCase(std::string_view string) const;
+
+	template <typename... ARGS>
+	void warning(fmt::format_string<ARGS...> format, ARGS&&... args) const
+	{
+		PrintFmt(PRINT_WARNING, "Parse Warning: {}:{}: {}\n", m_config.lumpName,
+		       m_lineNumber, fmt::format(format, std::forward<ARGS>(args)...));
+	}
+
+	template <typename... ARGS>
+	[[noreturn]] void error(fmt::format_string<ARGS...> format, ARGS&&... args) const
+	{
+		I_Error("Parse Error: {}:{}: {}", m_config.lumpName, m_lineNumber,
+		        fmt::format(format, std::forward<ARGS>(args)...));
+	}
+};

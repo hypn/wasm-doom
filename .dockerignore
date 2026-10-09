@@ -1,0 +1,6 @@
+# Local build output and git history aren't needed to build the image.
+# (DOOM1.WAD is deliberately not ignored: the build needs it.)
+.git
+build
+dist
+**/node_modules

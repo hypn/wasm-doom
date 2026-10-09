@@ -1,0 +1,107 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: b133e5fce39557b1f50e69df0e6b76f3146ae36f $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Ticker.
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "p_local.h"
+#include "c_effect.h"
+#include "p_acs.h"
+#include "c_console.h"
+#include "p_unlag.h"
+#include "p_horde.h"
+#include "g_spree.h"
+
+//
+// P_AtInterval
+//
+// Decides if it is time to perform a function that is to be performed
+// at regular intervals
+//
+bool P_AtInterval(int interval)
+{
+    return (gametic % interval) == 0;
+}
+
+void P_AnimationTick(AActor *mo);
+
+//
+// P_Ticker
+//
+void P_Ticker (void)
+{
+#ifdef CLIENT_APP
+	if (paused && displayplayer().isFreecam)
+	{
+		displayplayer().mo->RunThink();
+	}
+
+	// Game pauses when in the menu and not online/demo
+	if ((paused || (!multiplayer && !demoplayback &&
+		(menuactive || ConsoleState == c_down || ConsoleState == c_falling))) &&
+		(players.begin()->viewz != 1)) // Render the first tic to get proper viewheight
+	{
+		return;
+	}
+#endif
+
+	if (serverside)
+	{
+		P_RunHordeTics();
+		P_RunHelperTics();
+	}
+
+	if (clientside)
+		P_ThinkParticles ();	// [RH] make the particles think
+
+	if (clientside && serverside)
+	{
+		for (auto& player : players)
+			if (player.ingame())
+				P_PlayerThink(player);
+	}
+
+	// [SL] 2011-06-05 - Tick player actor animations here since P_Ticker is
+	// called only once per tick.  AActor::RunThink is called whenever the
+	// server receives a cmd from the client, which can happen multiple times
+	// in a single gametic.
+	for (auto& player : players)
+	{
+		P_AnimationTick(player.mo);
+	}
+
+	DThinker::RunThinkers ();
+
+	P_UpdateSpecials ();
+	P_RespawnSpecials ();
+
+	P_TicSprees();
+
+	if (clientside)
+		P_RunEffects(); // [RH] Run particle effects
+
+	// for par times
+	level.time++;
+}
+
+VERSION_CONTROL (p_tick_cpp, "$Id: b133e5fce39557b1f50e69df0e6b76f3146ae36f $")

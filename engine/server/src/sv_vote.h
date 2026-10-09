@@ -1,0 +1,85 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 14f71441624f03ed23c9a1057d2beff96b3b2c77 $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//  Server voting-specific stuff.
+//
+//-----------------------------------------------------------------------------
+
+#pragma once
+
+#include "c_vote.h"
+#include "d_player.h"
+
+class Vote
+{
+protected:
+	byte caller_id;
+	unsigned int countdown;
+	std::string error;
+	vote_result_t result;
+	std::map<int, vote_result_t> tally;
+	std::string votestring;
+public:
+	Vote(const char* cname, const cvar_t* ccvar) : countdown(0), error(""), result(VOTE_UNDEC), votestring(""), name(cname), cvar(ccvar) { };
+	virtual ~Vote() { };
+	const char* name;
+	const cvar_t* cvar;
+	[[nodiscard]] unsigned int get_countdown() const { return this->countdown; }
+	[[nodiscard]] std::string get_error() const { return this->error; }
+	[[nodiscard]] vote_result_t get_result() const { return this->result; }
+	[[nodiscard]] std::string get_votestring() const { return this->votestring; }
+	vote_result_t check();
+	[[nodiscard]] size_t count_yes() const;
+	[[nodiscard]] size_t count_no() const;
+	[[nodiscard]] size_t count_abs() const;
+	[[nodiscard]] size_t calc_yes(const bool noabs = false) const;
+	[[nodiscard]] size_t calc_no() const;
+	[[nodiscard]] vote_state_t serialize() const;
+	void ev_disconnect(player_t &player);
+	bool ev_tic();
+	bool init(const std::vector<std::string> &args, const player_t &player);
+	void parse(vote_result_t vote_result);
+	bool vote(player_t &player, bool ballot);
+	bool setup_check_cvar();
+	// Subclass this method with checks that should run before a vote is
+	// started.  If the vote can start, you should store enough state to
+	// successfully execute the vote once the vote is over, set the
+	// votestring, and return true.  Otherwise, set an error and return false.
+	virtual bool setup(const std::vector<std::string> &args, const player_t &player)
+	{
+		return true;
+	}
+	// Subclass this method with checks that should run every tic.  If the
+	// vote should be aborted, set an error and return false.  Otherwise,
+	// return true.
+	virtual bool tic()
+	{
+		return true;
+	}
+	// Subclass this method with the actual commands that should be executed
+	// if the vote passes.
+	virtual bool exec()
+	{
+		return true;
+	}
+};
+
+void SV_Callvote(player_t &player);
+void SV_VoteCmd(player_t& player, const std::vector<std::string>& args);
+void Vote_Disconnect(player_t &player);
+void Vote_Runtic();

@@ -1,0 +1,34 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 375c38b387e9530068b15163d00dbc9d61bfd1ee $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//		Default Config File.
+//
+//-----------------------------------------------------------------------------
+
+
+#pragma once
+
+#include <string>
+
+void M_LoadDefaults();
+
+void M_SaveDefaults(std::string filename = "");
+
+std::string M_GetConfigPath();
+std::string M_ExpandTokens(const std::string &str);

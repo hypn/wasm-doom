@@ -1,0 +1,177 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 6f97667af9a6f68eee541905dc6c64ef4633ec1e $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	WAD I/O functions.
+//
+//-----------------------------------------------------------------------------
+
+
+#pragma once
+
+#include "z_zone.h"
+#include "r_defs.h"
+#include "m_resfile.h"
+
+
+// [RH] Compare wad header as ints instead of chars
+#define IWAD_ID (('I')|('W'<<8)|('A'<<16)|('D'<<24))
+#define PWAD_ID (('P')|('W'<<8)|('A'<<16)|('D'<<24))
+
+// [RH] Remove limit on number of WAD files
+extern OResFiles wadfiles;
+extern OResFiles patchfiles;
+extern OWantFiles missingfiles;
+extern bool missingCommercialIWAD;
+
+//
+// TYPES
+//
+typedef struct
+{
+	// Should be "IWAD" or "PWAD".
+	unsigned	identification;
+	int			numlumps;
+	int			infotableofs;
+
+} wadinfo_t;
+
+#pragma pack(push, 1)
+struct filelump_t
+{
+	int			filepos;
+	int			size;
+	char		name[8]; // denis - todo - string
+
+};
+#pragma pack(pop)
+
+//
+// WADFILE I/O related stuff.
+//
+typedef struct lumpinfo_s
+{
+	OLumpName	name;
+	FILE		*handle; // TODO: uqFile
+	int			position;
+	int			size;
+
+	// [RH] Hashing stuff
+	int			next;
+	int			index;
+
+	int			namespc;
+} lumpinfo_t;
+
+// [RH] Namespaces from BOOM.
+typedef enum {
+	ns_global = 0,
+	ns_textures,
+	ns_sprites,
+	ns_flats,
+	ns_colormaps,
+} namespace_t;
+
+struct lumpHandle_t
+{
+	size_t id;
+	lumpHandle_t() : id(0)
+	{
+	}
+	void clear()
+	{
+		id = 0;
+	}
+	bool empty() const
+	{
+		return id == 0;
+	}
+	[[nodiscard]]
+	bool operator==(const lumpHandle_t& other) const
+	{
+		return id == other.id;
+	}
+};
+
+extern	void**		lumpcache;
+extern	lumpinfo_t*	lumpinfo;
+extern	size_t	numlumps;
+
+OCRC32Sum W_CRC32(const std::string& filename);
+OMD5Hash W_MD5(const std::string& filename);
+OMD5Hash W_MD5(const unsigned char* data, size_t size);
+
+// The engine's resources, compiled into the executable from
+// wad/resources.wad.  They always occupy wadfiles[0].
+extern const unsigned char W_BuiltinResources[];
+extern const size_t W_BuiltinResourcesSize;
+fhfprint_t W_FarmHash128(const byte* lumpdata, int length);
+void W_InitMultipleFiles(const OResFiles& filenames);
+lumpHandle_t W_LumpToHandle(const unsigned lump);
+int W_HandleToLump(const lumpHandle_t handle);
+
+int W_CheckNumForName(const char *name, int ns = ns_global);
+inline int W_CheckNumForName(const OLumpName& name, int ns = ns_global) { return W_CheckNumForName(name.c_str(), ns); };
+int W_GetNumForName(const char *name, int ns = ns_global);
+inline int W_GetNumForName(const OLumpName& name, int ns = ns_global) { return W_GetNumForName(name.c_str(), ns); };
+
+OLumpName W_LumpName(unsigned lump);
+unsigned	W_LumpLength (unsigned lump);
+void		W_ReadLump (unsigned lump, void *dest);
+unsigned	W_ReadChunk (const char *file, unsigned offs, unsigned len, void *dest, unsigned &filelen);
+
+void* W_CacheLumpNum(unsigned lump, const zoneTag_e tag);
+void* W_CacheLumpName(const char* name, const zoneTag_e tag);
+void* W_CacheLumpName(const OLumpName& name, const zoneTag_e tag);
+patch_t* W_CachePatch(unsigned lump, const zoneTag_e tag = PU_CACHE);
+patch_t* W_CachePatch(const char* name, const zoneTag_e tag = PU_CACHE);
+patch_t* W_CachePatch(const OLumpName& name, const zoneTag_e tag = PU_CACHE);
+lumpHandle_t W_CachePatchHandle(const int lumpNum, const zoneTag_e tag = PU_CACHE);
+lumpHandle_t W_CachePatchHandle(const char* name, const zoneTag_e tag = PU_CACHE,
+                                int ns = ns_global);
+lumpHandle_t W_CachePatchHandle(const OLumpName&, const zoneTag_e tag = PU_CACHE,
+                                int ns = ns_global);
+patch_t* W_ResolvePatchHandle(const lumpHandle_t lump);
+
+void	W_Profile (const char *fname);
+
+void	W_Close ();
+
+int		W_FindLump (const char *name, int lastlump);	// [RH]	Find lumps with duplication
+bool	W_CheckLumpName (unsigned lump, const char *name);	// [RH] True if lump's name == name // denis - todo - replace with map<>
+
+//unsigned W_LumpNameHash (const char *name);				// [RH] Create hash key from an 8-char name
+
+// [RH] Combine multiple marked ranges of lumps into one.
+void W_MergeLumps (const OLumpName& start, const OLumpName& end, int);
+
+// [RH] Copy an 8-char string and uppercase it.
+void uppercopy (char *to, const char *from);
+
+// [RH] Copies the lump name to to using uppercopy
+void W_GetLumpName(char* to, unsigned lump);
+
+// Copies the lump name to to
+void W_GetOLumpName(OLumpName& to, unsigned lump);
+OLumpName W_GetOLumpName(unsigned lump);
+
+// [RH] Returns file handle for specified lump
+int W_GetLumpFile (unsigned lump);
+
+// [RH] Put a lump in a certain namespace
+//void W_SetLumpNamespace (unsigned lump, int nmspace);

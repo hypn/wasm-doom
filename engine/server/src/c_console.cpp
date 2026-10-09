@@ -1,0 +1,252 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: e816f974aada1e1c8d4751c331eb2bfd02ccb516 $
+//
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom 1.22).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	C_CONSOLE
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include <ctime>
+
+#include <stdarg.h>
+
+#include "fmt/color.h"
+
+#include "m_fileio.h"
+#include "m_memio.h"
+#include "c_console.h"
+#include "c_dispatch.h"
+#include "v_palette.h"
+#include "sv_main.h"
+#include "gi.h"
+#include "v_textcolors.h"
+#include "svc_message.h"
+
+
+static const int MAX_LINE_LENGTH = 8192;
+
+struct History
+{
+	struct History *Older;
+	struct History *Newer;
+	char String[1];
+};
+
+// CmdLine[0]  = # of chars on command line
+// CmdLine[1]  = cursor position
+// CmdLine[2+] = command line (max 255 chars + NULL)
+// CmdLine[259]= offset from beginning of cmdline to display
+//static byte CmdLine[260];
+
+static struct History *HistTail = NULL;
+
+#define PRINTLEVELS 5
+
+EXTERN_CVAR (log_fulltimestamps)
+
+char *TimeStamp()
+{
+	static char stamp[38];
+
+	time_t ti = time(NULL);
+	struct tm *lt = localtime(&ti);
+
+	if(lt)
+	{
+		if (log_fulltimestamps)
+		{
+            snprintf (stamp,
+                     38,
+                     "[%.2d/%.2d/%.2d %.2d:%.2d:%.2d]",
+                     lt->tm_mday,
+                     lt->tm_mon + 1,	// localtime returns 0-based month
+                     lt->tm_year + 1900,
+                     lt->tm_hour,
+                     lt->tm_min,
+                     lt->tm_sec);
+		}
+		else
+		{
+            snprintf (stamp,
+                     38,
+                     "[%.2d:%.2d:%.2d]",
+                     lt->tm_hour,
+                     lt->tm_min,
+                     lt->tm_sec);
+		}
+	}
+	else
+		*stamp = 0;
+
+	return stamp;
+}
+
+EXTERN_CVAR(log_color)
+
+static size_t PrintString(int printlevel, std::string str)
+{
+	StripColorCodes(str);
+
+	fmt::text_style style;
+	switch (printlevel)
+	{
+		case PRINT_CHAT:
+		case PRINT_FILTERCHAT:
+			style = fg(fmt::color::light_green);
+			break;
+		case PRINT_TEAMCHAT:
+			style = fg(fmt::color::orange);
+			break;
+		case PRINT_SERVERCHAT:
+			style = fg(fmt::color::dark_orange);
+			break;
+		case PRINT_WARNING:
+			style = fmt::emphasis::bold | fg(fmt::color::yellow);
+			break;
+		case PRINT_ERROR:
+			style = fmt::emphasis::bold | fg(fmt::color::red);
+			break;
+		case PRINT_PICKUP:
+			// do these even ever get printed serverside?
+			style = fg(fmt::color::red);
+			break;
+		case PRINT_OBITUARY:
+			style = fg(fmt::color::yellow);
+			break;
+		case PRINT_HIGH:
+		case PRINT_FILTERHIGH:
+		case PRINT_NORCON:
+			break;
+	}
+
+	if (log_color && I_ConsoleUseColor())
+		fmt::print(stdout, style, "{}", str);
+	else
+		fmt::print(stdout, "{}", str);
+	fflush(stdout);
+
+	if (LOG.is_open())
+	{
+		if (log_color == 2)
+			LOG << fmt::format(style, "{}", str);
+		else
+			LOG << str;
+		LOG.flush();
+	}
+
+	return str.length();
+}
+
+extern bool gameisdead;
+
+size_t C_BasePrint(const int printlevel, const char* color_code, const std::string& str)
+{
+	(void)color_code;
+	if (gameisdead)
+		return 0;
+
+	std::string newStr = str;
+
+	// denis - 0x07 is a system beep, which can DoS the console (lol)
+	for (auto& c : newStr)
+		if (c == 0x07)
+			c = '.';
+
+	newStr = std::string(TimeStamp()) + " " + newStr;
+
+	if (newStr[newStr.length() - 1] != '\n')
+		newStr += '\n';
+
+	// Only allow sending internal messages to RCON players that are PRINT_HIGH
+	for (auto& player : players)
+	{
+		client_t* cl = &(player.client);
+
+		// Only allow RCON messages that are PRINT_HIGH
+		if (cl->allow_rcon && (printlevel == PRINT_HIGH || printlevel == PRINT_WARNING ||
+		                       printlevel == PRINT_ERROR))
+		{
+			MSG_WriteSVC(&cl->reliablebuf, SVC_Print(PRINT_WARNING, newStr));
+		}
+	}
+
+	return PrintString(printlevel, newStr);
+}
+
+BEGIN_COMMAND (history)
+{
+	struct History *hist = HistTail;
+
+	while (hist)
+	{
+		PrintFmt(PRINT_HIGH, "   {}\n", hist->String);
+		hist = hist->Newer;
+	}
+}
+END_COMMAND (history)
+
+BEGIN_COMMAND (echo)
+{
+	if (argc > 1)
+	{
+		std::string text = C_ArgCombine(argc - 1, (const char **)(argv + 1));
+		PrintFmt(PRINT_HIGH, "{}\n", text);
+	}
+}
+END_COMMAND (echo)
+
+void C_MidPrint (const char *msg, player_t *p, int msgtime)
+{
+    if (p == NULL)
+        return;
+
+    SV_MidPrint(msg, p, msgtime);
+}
+
+/****** Tab completion code ******/
+
+typedef std::map<std::string, size_t> tabcommand_map_t; // name, use count
+tabcommand_map_t &TabCommands()
+{
+	static tabcommand_map_t _TabCommands;
+	return _TabCommands;
+}
+
+void C_AddTabCommand (const char *name)
+{
+	tabcommand_map_t::iterator i = TabCommands().find(name);
+
+	if(i != TabCommands().end())
+		TabCommands()[name]++;
+	else
+		TabCommands()[name] = 1;
+}
+
+void C_RemoveTabCommand (const char *name)
+{
+	tabcommand_map_t::iterator i = TabCommands().find(name);
+
+	if(i != TabCommands().end())
+		if(!--i->second)
+			TabCommands().erase(i);
+}
+
+VERSION_CONTROL (c_console_cpp, "$Id: e816f974aada1e1c8d4751c331eb2bfd02ccb516 $")

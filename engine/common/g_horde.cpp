@@ -1,0 +1,493 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: c4eec0294d667dd5b9dc0794ba379503ac744d4a $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//   Non-ingame horde functionality.
+//
+//-----------------------------------------------------------------------------
+
+#include "odamex.h"
+
+#include "g_horde.h"
+
+#include <set>
+
+#include "cmdlib.h"
+#include "d_items.h"
+#include "hashtable.h"
+#include "infomap.h"
+#include "oscanner.h"
+#include "w_wad.h"
+
+extern std::vector<hordeDefine_t> WAVE_DEFINES;
+
+static hordeDefine_t EMPTY_WAVE_DEFINE;
+
+typedef OHashTable<std::string, mobjtype_t> AliasMap;
+AliasMap g_aliasMap;
+
+static mobjtype_t NameOrAliasToMobj(const std::string& name)
+{
+	AliasMap::iterator it = ::g_aliasMap.find(name);
+	if (it != ::g_aliasMap.end())
+	{
+		return it->second;
+	}
+	else
+	{
+		return P_NameToMobj(name);
+	}
+}
+
+static void ParsePowerupConfig(OScanner& os, hordeDefine_t::powConfig_t& outConfig)
+{
+	for (;;)
+	{
+		os.mustScan(); // Prime the next token.
+		if (os.compareToken("}"))
+		{
+			// Bail out of the block.
+			break;
+		}
+		else if (os.compareToken("chance"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanFloat();
+			outConfig.chance = os.getTokenFloat();
+		}
+		else
+		{
+			// We don't know what this token is.
+			os.error("Unknown Powerup Token \"{}\".", os.getToken());
+		}
+	}
+}
+
+static void ParseMonsterConfig(OScanner& os, hordeDefine_t::monConfig_t& outConfig)
+{
+	for (;;)
+	{
+		os.mustScan(); // Prime the next token.
+		if (os.compareToken("}"))
+		{
+			// Bail out of the block.
+			break;
+		}
+		else if (os.compareToken("grouphealth"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanInt();
+			outConfig.minGroupHealth = os.getTokenInt();
+			os.mustScan();
+			os.assertTokenIs(",");
+			os.mustScanInt();
+			outConfig.maxGroupHealth = os.getTokenInt();
+		}
+		else if (os.compareToken("chance"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanFloat();
+			outConfig.chance = os.getTokenFloat();
+		}
+		else if (os.compareToken("limit"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanInt();
+			outConfig.limit = os.getTokenInt();
+		}
+		else
+		{
+			// We don't know what this token is.
+			os.error("Unknown Monster/Boss Token \"{}\".", os.getToken());
+		}
+	}
+}
+
+static void ParseDefine(OScanner& os)
+{
+	hordeDefine_t define;
+
+	os.assertTokenIs("define");
+	os.mustScan();
+	define.name = os.getToken();
+	os.mustScan();
+	os.assertTokenIs("{");
+
+	for (;;)
+	{
+		os.mustScan(); // Prime the next token.
+		if (os.compareToken("}"))
+		{
+			// Bail out of the block.
+			break;
+		}
+		else if (os.compareToken("grouphealth"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanInt();
+			define.minGroupHealth = os.getTokenInt();
+			os.mustScan();
+			os.assertTokenIs(",");
+			os.mustScanInt();
+			define.maxGroupHealth = os.getTokenInt();
+		}
+		else if (os.compareToken("bosshealth"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+			os.mustScanInt();
+			define.minBossHealth = os.getTokenInt();
+			os.mustScan();
+			os.assertTokenIs(",");
+			os.mustScanInt();
+			define.maxBossHealth = os.getTokenInt();
+		}
+		else if (os.compareToken("weapons"))
+		{
+			os.mustScan();
+			os.assertTokenIs("=");
+
+			for (;;)
+			{
+				os.mustScan();
+				const weapontype_t weapon = P_NameToWeapon(os.getToken());
+				if (weapon == wp_none)
+				{
+					// Special case for berserk.
+					if (os.compareTokenNoCase("Berserk"))
+					{
+						// wp_none will be added as a special case.
+					}
+					else
+					{
+						os.error("Unknown weapon \"{}\".", os.getToken());
+					}
+				}
+				define.weapons.push_back(weapon);
+				os.mustScan();
+				if (!os.compareToken(","))
+				{
+					// End of the list.
+					os.unScan();
+					break;
+				}
+			}
+		}
+		else if (os.compareToken("addpowerup"))
+		{
+			// Powerup name.
+			os.mustScan();
+			const mobjtype_t type = NameOrAliasToMobj(os.getToken());
+			if (type == MT_NULL)
+			{
+				os.error("Unknown powerup \"{}\".", os.getToken());
+			}
+
+			// Config block.
+			hordeDefine_t::powConfig_t config;
+			os.mustScan();
+			if (os.getToken() == "{")
+			{
+				ParsePowerupConfig(os, config);
+			}
+			else
+			{
+				// Use default config.
+				os.unScan();
+			}
+
+			define.addPowerup(type, config);
+		}
+		else if (os.compareToken("addmonster"))
+		{
+			// Monster name.
+			os.mustScan();
+			const mobjtype_t type = NameOrAliasToMobj(os.getToken());
+			if (type == MT_NULL)
+			{
+				os.error("Unknown monster \"{}\".", os.getToken());
+			}
+
+			// Config block.
+			hordeDefine_t::monConfig_t config;
+			os.mustScan();
+			if (os.getToken() == "{")
+			{
+				ParseMonsterConfig(os, config);
+			}
+			else
+			{
+				// Use default config.
+				os.unScan();
+			}
+
+			define.addMonster(hordeDefine_t::RM_NORMAL, type, config);
+		}
+		else if (os.compareToken("addboss"))
+		{
+			// Monster name.
+			os.mustScan();
+			const mobjtype_t type = NameOrAliasToMobj(os.getToken());
+			if (type == MT_NULL)
+			{
+				os.error("Unknown boss \"{}\".", os.getToken());
+			}
+
+			// Config block.
+			hordeDefine_t::monConfig_t config;
+			os.mustScan();
+			if (os.getToken() == "{")
+			{
+				ParseMonsterConfig(os, config);
+			}
+			else
+			{
+				// Use default config.
+				os.unScan();
+			}
+
+			define.addMonster(hordeDefine_t::RM_BOSS, type, config);
+		}
+		else
+		{
+			// We don't know what this token is.
+			os.error("Unknown Token \"{}\".", os.getToken());
+		}
+	}
+
+	// Add ammo for the weapons in order of their definition.
+	std::set<ammotype_t> ammoAdded;
+	for (const auto weap : define.weapons)
+	{
+		// Is the weapon valid?
+		if (weap < wp_fist || weap >= NUMWEAPONS)
+		{
+			continue;
+		}
+
+		// Does the weapon have ammo?
+		const ammotype_t ammo = ::weaponinfo[weap].ammotype;
+		if (ammo == am_noammo)
+		{
+			continue;
+		}
+
+		// Have we already added ammo for it?
+		if (ammoAdded.find(ammo) != ammoAdded.end())
+		{
+			continue;
+		}
+
+		ammoAdded.insert(ammo);
+		define.ammos.push_back(ammo);
+	}
+
+	if (define.name.empty())
+	{
+		os.error("Define doesn't have a name.");
+	}
+	if (define.weapons.empty())
+	{
+		os.warning("No weapon pickups found for define \"{}\".", define.name);
+	}
+	if (define.monsters.empty())
+	{
+		os.error("No monsters found for define \"{}\".", define.name);
+	}
+	if (define.powerups.empty())
+	{
+		os.error("No powerups found for define \"{}\".", define.name);
+	}
+	if (define.minGroupHealth < 0)
+	{
+		os.error("Minimum group health for define \"{}\" was not set.",
+		         define.name);
+	}
+	if (define.maxGroupHealth <= 0)
+	{
+		os.error("Maximum group health for define \"{}\" was not set.",
+		         define.name);
+	}
+	if (define.minGroupHealth > define.maxGroupHealth)
+	{
+		os.error("Maximum group health for define \"{}\" is less than minimum.",
+		         define.name);
+	}
+	if (define.minBossHealth < 0)
+	{
+		os.error("Minimum boss health for define \"{}\" was not set.",
+		         define.name);
+	}
+	if (define.maxBossHealth <= 0)
+	{
+		os.error("Maximum boss health for define \"{}\" was not set.",
+		         define.name);
+	}
+	if (define.minBossHealth > define.maxBossHealth)
+	{
+		os.error("Maximum boss health for define \"{}\" is less than minimum.",
+		         define.name);
+	}
+
+	::WAVE_DEFINES.push_back(define);
+}
+
+static void ParseAlias(OScanner& os)
+{
+	os.assertTokenIs("alias");
+	os.mustScan();
+	std::string alias = os.getToken();
+	os.mustScan();
+	std::string original = os.getToken();
+
+	const mobjtype_t otype = P_NameToMobj(original);
+	if (otype == MT_NULL)
+	{
+		// We don't know what this token is.
+		os.error("Can't alias unknown thing \"{}\".", original);
+	}
+
+	if (!CheckIfDehActorDefined(otype))
+	{
+		// [Blair] DEHEXTRA monster not defined
+		os.error("The following actor is undefined: \"{}\".", original);
+	}
+
+	g_aliasMap.emplace(alias, otype);
+}
+
+static void ParseHordeDef(const int lump, const OLumpName& name)
+{
+	const char* buffer = static_cast<char*>(W_CacheLumpNum(lump, PU_STATIC));
+
+	OScannerConfig config = {
+	    name,  // lumpName
+	    false, // semiComments
+	    true,  // cComments
+	};
+	OScanner os = OScanner::openBuffer(config, buffer, buffer + W_LumpLength(lump));
+
+	// Right now we only understand one top-level token - "define".
+	while (os.scan())
+	{
+		if (os.compareTokenNoCase("define"))
+		{
+			ParseDefine(os);
+		}
+		else if (os.compareTokenNoCase("cleardefines"))
+		{
+			::WAVE_DEFINES.clear();
+		}
+		else if (os.compareTokenNoCase("alias"))
+		{
+			ParseAlias(os);
+		}
+		else
+		{
+			// We don't know what this token is.
+			os.error("Unknown Token \"{}\".", os.getToken());
+		}
+	}
+}
+
+/**
+ * @brief Cmp function for sorting defines by max group health.
+ */
+static bool CmpHordeDefs(const hordeDefine_t& a, const hordeDefine_t& b)
+{
+	return a.maxGroupHealth < b.maxGroupHealth;
+}
+
+struct FindHordeDef
+{
+	std::string name;
+	FindHordeDef(const std::string& name) : name(name) { }
+	bool operator()(const hordeDefine_t& def) { return def.name == name; }
+};
+
+static void ParseHordeDefs()
+{
+	int lump = -1;
+	while ((lump = W_FindLump("HORDEDEF", lump)) != -1)
+	{
+		ParseHordeDef(lump, "HORDEDEF");
+	}
+
+	if (::WAVE_DEFINES.empty())
+	{
+		return;
+	}
+
+	// Must be stable for wave ID's to be the same on client and server.
+	std::stable_sort(::WAVE_DEFINES.begin(), ::WAVE_DEFINES.end(), CmpHordeDefs);
+
+	// Dedupe wave defines.
+	for (std::vector<hordeDefine_t>::iterator it = ::WAVE_DEFINES.begin();
+	     it != ::WAVE_DEFINES.end(); ++it)
+	{
+		std::vector<hordeDefine_t>::iterator after = it;
+		after++;
+
+		// No need to search if we're at the end.
+		if (after == ::WAVE_DEFINES.end())
+			continue;
+
+		std::vector<hordeDefine_t>::iterator found =
+		    std::find_if(after, ::WAVE_DEFINES.end(), FindHordeDef(it->name));
+
+		// If we didn't find any matches, don't remove.
+		if (found == ::WAVE_DEFINES.end())
+			continue;
+
+		// Erase and set our iterator to the one after it.
+		it = ::WAVE_DEFINES.erase(it);
+	}
+}
+
+/**
+ * @brief Initialize horde defines with the current set of loaded WAD files.
+ */
+void G_ParseHordeDefs()
+{
+	::WAVE_DEFINES.clear();
+	::g_aliasMap.clear();
+	ParseHordeDefs();
+}
+
+/**
+ * @brief Resolve a horde define ID to an actual define.  Should be identical on client
+ * and server.
+ *
+ * @param id ID of define.
+ */
+const hordeDefine_t& G_HordeDefine(size_t id)
+{
+	if (id >= ::WAVE_DEFINES.size())
+	{
+		PrintFmt(PRINT_WARNING,
+		         "Tried to access horde wave {} but only have {} horde defines!\n", id,
+		         ::WAVE_DEFINES.size());
+		return EMPTY_WAVE_DEFINE;
+	}
+
+	return ::WAVE_DEFINES[id];
+}

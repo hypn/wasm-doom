@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings everywhere, or bash fails with
+# "$'\r': command not found" (e.g. a Windows clone with core.autocrlf on).
+*.sh text eol=lf
+
+# Game data: never convert line endings.
+*.wad binary
+*.WAD binary

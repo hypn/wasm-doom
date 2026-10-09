@@ -1,0 +1,1206 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 0aceb9f0f9b6e48ecea9ffdc19f623e05e10267c $
+//
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// Revision 1.3  1997/01/29 20:10
+// DESCRIPTION:
+//		Preparation of data for rendering,
+//		generation of lookups, caching, retrieval by name.
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "i_system.h"
+#include "z_zone.h"
+
+
+#include "w_wad.h"
+
+#include "r_local.h"
+
+#include "r_sky.h"
+
+#include "cmdlib.h"
+
+#include "r_data.h"
+
+#include "v_palette.h"
+#include "v_video.h"
+
+#include <ctype.h>
+
+#include <cmath>
+
+#include <algorithm>
+#include <unordered_set>
+
+//
+// Graphics.
+// DOOM graphics for walls and sprites
+// is stored in vertical runs of opaque pixels (posts).
+// A column is composed of zero or more posts,
+// a patch or sprite is composed of zero or more columns.
+//
+
+int 			firstflat;
+int 			lastflat;
+int				numflats;
+
+int 			firstspritelump;
+int 			lastspritelump;
+int				numspritelumps;
+
+int				numtextures;
+texture_t** 	textures;
+
+int*			texturewidthmask;
+
+// needed for texture pegging
+fixed_t*		textureheight;
+static int*		texturecompositesize;
+static unsigned **texturecolumnofs;
+static byte**	texturecomposite;
+fixed_t*		texturescalex;
+fixed_t*		texturescaley;
+
+// for global animation
+bool*			flatwarp;
+byte**			warpedflats;
+int*			flatwarpedwhen;
+int*			flattranslation;
+
+using texhash_t = std::unordered_map<OLumpName, int32_t>;
+texhash_t texturehash;
+
+//
+// R_CalculateNewPatchSize
+//
+// Helper function for converting raw patches that use post_t into patches
+// that use tallpost_t. Returns the lump size of the converted patch.
+//
+size_t R_CalculateNewPatchSize(patch_t *patch, size_t length)
+{
+	if (!patch)
+		return 0;
+
+	// sanity check to see if the postofs array fits in the patch lump
+	if (length < patch->width() * sizeof(unsigned int))
+		return 0;
+
+	int numposts = 0, numpixels = 0;
+	unsigned int *postofs = (unsigned int *)((byte*)patch + 8);
+
+	for (int i = 0; i < patch->width(); i++)
+	{
+		size_t ofs = LELONG(postofs[i]);
+
+		// check that the offset is valid
+		if (ofs >= length)
+			return 0;
+
+		post_t *post = (post_t*)((byte*)patch + ofs);
+
+		while (post->topdelta != 0xFF)
+		{
+			if (ofs + post->length >= length)
+				return 0;		// patch is corrupt
+
+			numposts++;
+			numpixels += post->length;
+			post = (post_t*)((byte*)post + post->length + 4);
+		}
+	}
+
+	// 8 byte patch header
+	// 4 * width bytes for column offset table
+	// 4 bytes per post for post header
+	// 1 byte per pixel
+	// 2 bytes per column for termination
+	return 8 + 4 * patch->width() + 4 * numposts + numpixels + 2 * patch->width();
+}
+
+//
+// R_ConvertPatch
+//
+// Converts a patch that uses post_t posts into a patch that uses tallpost_t.
+//
+void R_ConvertPatch(patch_t* newpatch, patch_t* rawpatch, const unsigned int lump)
+{
+	if (!rawpatch || !newpatch)
+		return;
+
+	memcpy(newpatch, rawpatch, 8); // copy the patch header
+
+	uint32_t* rawpostofs = rawpatch->ofs();
+	uint32_t* newpostofs = newpatch->ofs();
+
+	uint32_t curofs = rawpatch->datastart(); // keep track of the column offset
+
+	for (int i = 0; i < rawpatch->width(); i++)
+	{
+		int newpost_top = -1;
+		int newpost_len = 0;
+
+		int abs_offset = 0;
+
+		newpostofs[i] = LELONG(curofs); // write the new offset for this column
+		post_t* rawpost = rawpatch->post(LELONG(rawpostofs[i]));
+		tallpost_t* newpost = newpatch->tallpost(curofs);
+
+		while (!rawpost->end())
+		{
+			// handle DeePsea tall patches where topdelta is treated as a relative
+			// offset instead of an absolute offset
+			abs_offset = rawpost->abs(abs_offset);
+			if (newpost_top == -1)
+				newpost_top = abs_offset;
+
+			// watch for column overruns
+			int length = rawpost->length;
+			if (abs_offset + length > rawpatch->height())
+				length = rawpatch->height() - abs_offset;
+
+			if (length < 0)
+			{
+				I_Error("{}: Patch {} appears to be corrupted.", __FUNCTION__,
+				        W_LumpName(lump));
+			}
+
+			// copy the pixels in the post
+			memcpy(newpost->data() + newpost_len, rawpost->data(), length);
+			newpost_len += length;
+
+			// Should we finish the post?
+			if (rawpost->next()->end() ||
+			    abs_offset + length != rawpost->next()->abs(abs_offset))
+			{
+				newpost->topdelta = newpost_top;
+				newpost->length = newpost_len;
+
+				curofs += newpost->size();
+				newpost = newpost->next();
+
+				newpost_top = -1;
+				newpost_len = 0;
+			}
+
+			rawpost = rawpost->next();
+		}
+
+		newpost->writeend();
+		curofs += 2;
+	}
+}
+
+//
+// MAPTEXTURE_T CACHING
+// When a texture is first needed,
+//	it counts the number of composite columns
+//	required in the texture and allocates space
+//	for a column directory and any new columns.
+// The directory will simply point inside other patches
+//	if there is only one patch in a given column,
+//	but any columns with multiple patches
+//	will have new column_ts generated.
+//
+// Rewritten by Lee Killough for performance and to fix Medusa bug
+//
+
+void R_DrawColumnInCache(const tallpost_t *post, byte *cache,
+						  int originy, int cacheheight, byte *marks)
+{
+	while (!post->end())
+	{
+		int count = post->length;
+		int position = post->topdelta + originy;
+
+		if (position < 0)
+		{
+			count += position;
+			position = 0;
+		}
+
+		if (position + count > cacheheight)
+			count = cacheheight - position;
+
+		if (count > 0)
+		{
+			memcpy(cache + position, post->data(), count);
+
+			// killough 4/9/98: remember which cells in column have been drawn,
+			// so that column can later be converted into a series of posts, to
+			// fix the Medusa bug.
+
+			memset(marks + position, 0xFF, count);
+		}
+
+		post = post->next();
+	}
+}
+
+// Some vanilla textures use patch offsets that were ignored by the vanilla executable
+// In Odamex, these cause issues and need to be set to zero manually
+void R_VanillaTextureHacks(texture_t* tex)
+{
+	if (tex->name == "SKY1" &&
+	    tex->height == 128 &&
+		tex->patchcount == 1 &&
+		tex->patches[0].originy == -8)
+	{
+		tex->patches[0].originy = 0;
+	}
+}
+
+//
+// R_GenerateComposite
+// Using the texture definition,
+//	the composite texture is created from the patches,
+//	and each column is cached.
+//
+// Rewritten by Lee Killough for performance and to fix Medusa bug
+
+void R_GenerateComposite (int texnum)
+{
+	byte *block = (byte *)Z_Malloc (texturecompositesize[texnum], PU_STATIC,
+						   (void **) &texturecomposite[texnum]);
+	texturecomposite[texnum] = block;
+	texture_t *texture = textures[texnum];
+
+	R_VanillaTextureHacks(texture);
+
+	// Composite the columns together.
+	texpatch_t *texpatch = texture->patches;
+
+	// killough 4/9/98: marks to identify transparent regions in merged textures
+	auto marks = std::make_unique<byte[]>(texture->width * texture->height);
+	memset(marks.get(), 0, texture->width * texture->height);
+
+	for (int i = texture->patchcount; --i >=0; texpatch++)
+	{
+		patch_t *patch = W_CachePatch(texpatch->patch);
+		int x1 = texpatch->originx, x2 = x1 + patch->width();
+		const int *cofs = patch->columnofs-x1;
+		if (x1<0)
+			x1 = 0;
+		if (x2 > texture->width)
+			x2 = texture->width;
+
+		for (; x1 < x2 ; x1++)
+		{
+			// killough 1/25/98, 4/9/98: Fix medusa bug.
+			tallpost_t *srcpost = (tallpost_t*)((byte*)patch + LELONG(cofs[x1]));
+			tallpost_t *destpost = (tallpost_t*)(block + texturecolumnofs[texnum][x1]);
+
+			R_DrawColumnInCache(srcpost, destpost->data(), texpatch->originy, texture->height,
+								&marks[x1 * texture->height]);
+		}
+	}
+
+	// killough 4/9/98: Next, convert multipatched columns into true columns,
+	// to fix Medusa bug while still allowing for transparent regions.
+
+	auto tmpdata = std::make_unique<byte[]>(texture->height);		// temporary post data
+	for (int i = 0; i < texture->width; i++)
+	{
+		tallpost_t *post = (tallpost_t *)(block + texturecolumnofs[texnum][i]);
+		const byte *mark = &marks[i * texture->height];
+		int j = 0;
+
+		// save column in temporary so we can shuffle it around
+		memcpy(tmpdata.get(), post->data(), texture->height);
+
+		// reconstruct the column by scanning transparency marks
+		while (true)
+		{
+			while (j < texture->height && !mark[j]) // skip transparent pixels
+				j++;
+			if (j >= texture->height) 				// if at end of column
+			{
+				post->writeend();					// end-of-column marker
+				break;
+			}
+
+			post->topdelta = j;						// starting offset of post
+
+			// count opaque pixels
+			for (post->length = 0; j < texture->height && mark[j]; j++)
+				post->length++;
+
+			// copy opaque pixels from the temporary back into the column
+			memcpy(post->data(), tmpdata.get() + post->topdelta, post->length);
+			post = post->next();
+		}
+	}
+
+	// Now that the texture has been built in column cache,
+	// it is purgable from zone memory.
+
+	Z_ChangeTag(block, PU_CACHE);
+}
+
+//
+// R_GenerateLookup
+//
+// Rewritten by Lee Killough for performance and to fix Medusa bug
+//
+
+void R_GenerateLookup(int texnum, int *const errors)
+{
+	const texture_t *texture = textures[texnum];
+
+	// Composited texture not created yet.
+
+	// killough 4/9/98: keep count of posts in addition to patches.
+	// Part of fix for medusa bug for multipatched 2s normals.
+	auto postcount = std::make_unique<uint16_t[]>(texture->width);
+
+	memset(postcount.get(), 0, sizeof(uint16_t) * texture->width);
+
+	const texpatch_t *texpatch = texture->patches;
+
+	for (int i = 0; i < texture->patchcount; i++)
+	{
+		const int patchnum = texpatch->patch;
+		const patch_t *patch = W_CachePatch(patchnum);
+		int x1 = texpatch++->originx, x2 = x1 + patch->width(), x = x1;
+		const int *cofs = patch->columnofs-x1;
+
+		if (x2 > texture->width)
+			x2 = texture->width;
+		if (x1 < 0)
+			x = 0;
+		for (; x < x2; x++)
+		{
+			// killough 4/9/98: keep a count of the number of posts in column,
+			// to fix Medusa bug while allowing for transparent multipatches.
+
+			const tallpost_t *post = (tallpost_t*)((byte*)patch + LELONG(cofs[x]));
+
+			// NOTE: this offset will be rewritten later if a composite is generated
+			// for this texture (eg, there's more than one patch)
+			texturecolumnofs[texnum][x] = (byte *)post - (byte *)patch;
+
+			while (!post->end())
+			{
+				postcount[x]++;
+				post = post->next();
+			}
+		}
+	}
+
+	// Now count the number of columns that are covered by more than one patch.
+	// Fill in the lump / offset, so columns with only a single patch are all done.
+
+	texturecomposite[texnum] = 0;
+	int csize = 0;
+
+	int x = texture->width;
+	while (--x >= 0)
+	{
+		// killough 1/25/98, 4/9/98:
+		//
+		// Fix Medusa bug, by adding room for column header
+		// and trailer bytes for each post in merged column.
+		// For now, just allocate conservatively 4 bytes
+		// per post per patch per column, since we don't
+		// yet know how many posts the merged column will
+		// require, and it's bounded above by this limit.
+
+		texturecolumnofs[texnum][x] = csize;
+
+		// 4 header bytes per post + column height + 2 byte terminator
+		csize += 4 * postcount[x] + 2 + texture->height;
+	}
+
+	texturecompositesize[texnum] = csize;
+}
+
+//
+// R_GetPatchColumn
+//
+tallpost_t* R_GetPatchColumn(int lumpnum, int colnum)
+{
+	patch_t* patch = W_CachePatch(lumpnum, PU_CACHE);
+	return (tallpost_t*)((byte*)patch + LELONG(patch->columnofs[colnum]));
+}
+
+//
+// R_GetPatchColumnData
+//
+byte* R_GetPatchColumnData(int lumpnum, int colnum)
+{
+	return R_GetPatchColumn(lumpnum, colnum)->data();
+}
+
+//
+// R_GetTextureColumn
+//
+tallpost_t* R_GetTextureColumn(int texnum, int colnum)
+{
+	short width = textures[texnum]->width;
+	int mask = texturewidthmask[texnum];
+	if (mask + 1 == width)
+		colnum &= mask;
+	else
+		colnum -= width * std::floor((float)colnum / (float)width);
+	int ofs = texturecolumnofs[texnum][colnum];
+
+	if (!texturecomposite[texnum])
+		R_GenerateComposite(texnum);
+
+	return (tallpost_t*)(texturecomposite[texnum] + ofs);
+}
+
+//
+// R_GetTextureColumnData
+//
+byte* R_GetTextureColumnData(int texnum, int colnum)
+{
+	return R_GetTextureColumn(texnum, colnum)->data();
+}
+
+
+//
+// R_InitTextures
+// Initializes the texture list
+//	with the textures from the world map.
+//
+static inline void RegisterTexture(texture_t* texture, int i, byte scalex = 0, byte scaley = 0)
+{
+	texturecolumnofs[i] = new unsigned int[texture->width];
+
+	int j;
+	for (j = 1; j*2 <= texture->width; j <<= 1)
+		;
+	texturewidthmask[i] = j-1;
+
+	textureheight[i] = texture->height << FRACBITS;
+
+	// [RH] Special for beta 29: Values of 0 will use the tx/ty cvars
+	// to determine scaling instead of defaulting to 8. I will likely
+	// remove this once I finish the betas, because by then, users
+	// should be able to actually create scaled textures.
+	texturescalex[i] = scalex ? scalex << (FRACBITS - 3) : FRACUNIT;
+	texturescaley[i] = scaley ? scaley << (FRACBITS - 3) : FRACUNIT;
+}
+
+struct texlump_t
+{
+	int32_t lumpnum = -1;
+	int32_t* data = nullptr;
+	int32_t* directory = nullptr;
+	int numtextures = 0;
+	int maxoff = 0;
+
+	explicit texlump_t(const char* name) : lumpnum(W_CheckNumForName(name))
+	{
+		if (lumpnum != -1)
+		{
+			maxoff = W_LumpLength(lumpnum);
+			data = static_cast<int32_t*>(W_CacheLumpNum(lumpnum, PU_STATIC));
+			numtextures = LELONG(*data);
+			directory = data + 1;
+		}
+	}
+
+	~texlump_t()
+	{
+		if (data)
+			Z_Free(data);
+	}
+};
+
+static int32_t R_LoadTextureLump(const texlump_t& texlump, const nonstd::span<const int> patchlookup, int texnum, texhash_t& texhash)
+{
+	int32_t* directory = texlump.directory;
+	int i;
+	for (i = texnum; i < texnum + texlump.numtextures; i++, directory++)
+	{
+		const int32_t offset = LELONG(*directory);
+
+		if (offset > texlump.maxoff)
+			I_FatalError("R_InitTextures: bad texture directory");
+
+		maptexture_t* mtexture = (maptexture_t *) ( (byte *)texlump.data + offset);
+
+		texture_t* texture = textures[i] = (texture_t *)
+			Z_Malloc (sizeof(texture_t)
+					  + sizeof(texpatch_t)*(SAFESHORT(mtexture->patchcount)-1),
+					  PU_STATIC, nullptr);
+
+		texture->width = SAFESHORT(mtexture->width);
+		texture->height = SAFESHORT(mtexture->height);
+		texture->patchcount = SAFESHORT(mtexture->patchcount);
+
+		texture->name = mtexture->name;
+
+		const mappatch_t* mpatch = &mtexture->patches[0];
+		texpatch_t* patch = &texture->patches[0];
+
+		for (int j = 0; j < texture->patchcount ; j++, mpatch++, patch++)
+		{
+			patch->originx = LESHORT(mpatch->originx);
+			patch->originy = LESHORT(mpatch->originy);
+			const int16_t patchnum = LESHORT(mpatch->patch);
+			if (patchnum >= 0 && static_cast<size_t>(patchnum) < patchlookup.size())
+				patch->patch = patchlookup[patchnum];
+			else
+			 	patch->patch = -1;
+			if (patch->patch == -1)
+			{
+				patch->patch = W_CheckNumForName("TNT1A0", ns_sprites);
+				PrintFmt(PRINT_WARNING, "R_InitTextures: Missing patch in texture {}\n", texture->name);
+				// [EB] Make missing patches non-fatal
+				// other ports have annoyingly started doing this
+				// and so we do to if we want all the wads to work...
+				// errors++;
+			}
+		}
+
+		RegisterTexture(texture, i, mtexture->scalex, mtexture->scaley);
+
+		if (texhash.find(texture->name) == texhash.end())
+			texhash[texture->name] = i;
+	}
+	return i;
+}
+
+void R_InitTextures()
+{
+	std::vector<int> patchlookup;
+
+	int					numpatches;
+	int					tx_numtextures;
+
+	int					errors = 0;
+
+	// for TX_START/TX_END
+	int					first_tx;
+
+	// Load the patch names from pnames.lmp.
+	{
+		char *names = (char *)W_CacheLumpName ("PNAMES", PU_STATIC);
+		char *name_p = names+4;
+
+		numpatches = LELONG ( *((int *)names) );
+
+		// Put a guard here in case one of the pair is missing.
+		const int tx_startlump = W_CheckNumForName("TX_START");
+		const int tx_endlump = W_CheckNumForName("TX_END");
+		if (tx_startlump != -1 && tx_endlump != -1 && tx_endlump > tx_startlump)
+		{
+			first_tx = tx_startlump + 1;
+			tx_numtextures = tx_endlump - tx_startlump - 1;
+		}
+		else
+		{
+			first_tx = 0;
+			tx_numtextures = 0;
+		}
+
+		patchlookup.resize(numpatches);
+
+		for (int i = 0; i < numpatches; i++)
+		{
+			patchlookup[i] = W_CheckNumForName(name_p + i*8);
+
+			// [EB] some wads use the texture namespace but then still use those in pnames
+			if (patchlookup[i] == -1)
+				patchlookup[i] = W_CheckNumForName(name_p + i*8, ns_textures);
+
+			if (patchlookup[i] == -1)
+			{
+				// killough 4/17/98:
+				// Some wads use sprites as wall patches, so repeat check and
+				// look for sprites this time, but only if there were no wall
+				// patches found. This is the same as allowing for both, except
+				// that wall patches always win over sprites, even when they
+				// appear first in a wad. This is a kludgy solution to the wad
+				// lump namespace problem.
+
+				patchlookup[i] = W_CheckNumForName(name_p + i*8, ns_sprites);
+			}
+		}
+		Z_Free (names);
+	}
+
+	texturehash.clear();
+	const texlump_t texture1("TEXTURE1");
+	const texlump_t texture2("TEXTURE2");
+
+	// denis - fix memory leaks
+	for (int i = 0; i < numtextures; i++)
+	{
+		delete[] texturecolumnofs[i];
+	}
+
+	// denis - fix memory leaks
+	delete[] textures;
+	delete[] texturecolumnofs;
+	delete[] texturecomposite;
+	delete[] texturecompositesize;
+	delete[] texturewidthmask;
+	delete[] textureheight;
+	delete[] texturescalex;
+	delete[] texturescaley;
+
+	numtextures = texture1.numtextures + texture2.numtextures + tx_numtextures;
+
+	const int first_pname_tex = numtextures;
+	const int numpnamestextures = std::count_if(patchlookup.begin(), patchlookup.end(), [](const int patch){ return patch != -1; });
+	numtextures += numpnamestextures;
+
+	textures = new texture_t *[numtextures];
+	texturecolumnofs = new unsigned int *[numtextures];
+	texturecomposite = new byte *[numtextures];
+	texturecompositesize = new int[numtextures];
+	texturewidthmask = new int[numtextures];
+	textureheight = new fixed_t[numtextures];
+	texturescalex = new fixed_t[numtextures];
+	texturescaley = new fixed_t[numtextures];
+
+	texhash_t texturehash2;
+	// [EB] texture1 goes to texturehash2 because .insert only inserts for keys that don't already exist
+	//      and we need texture2 to override texture1
+	int texnum = R_LoadTextureLump(texture1, patchlookup, 0, texturehash2);
+	texnum = R_LoadTextureLump(texture2, patchlookup, texnum, texturehash);
+	texturehash.insert(texturehash2.begin(), texturehash2.end());
+
+	const auto createTexture = [&](int textureIndex,
+	                               int patchLump,
+	                               bool overwriteHash)
+	{
+	    const patch_t* patch = W_CachePatch(patchLump, PU_CACHE);
+
+		texture_t* texture =
+			textures[textureIndex] =
+				static_cast<texture_t*>(Z_Malloc(sizeof(texture_t), PU_STATIC, nullptr));
+
+		texture->name = lumpinfo[patchLump].name;
+		texture->width = patch->width();
+		texture->height = patch->height();
+		texture->patchcount = 1;
+
+		texture->patches->patch = patchLump;
+		texture->patches->originx = 0;
+		texture->patches->originy = 0;
+
+		RegisterTexture(texture, textureIndex);
+
+		if (overwriteHash)
+			texturehash[texture->name] = textureIndex;
+		else
+			texturehash.try_emplace(texture->name, textureIndex);
+	};
+
+	// TX_ marker (texture namespace) parsed here
+	for (int i = texnum, j = 0; j < tx_numtextures; i++, j++)
+	{
+		createTexture(i, first_tx + j, true);
+	}
+
+	for (int i = first_pname_tex, j = 0; j < numpatches; j++)
+	{
+		if (patchlookup[j] != -1)
+		{
+			createTexture(i, patchlookup[j], false);
+			i++;
+		}
+	}
+
+	if (errors)
+		I_FatalError("{} errors in R_InitTextures.", errors);
+
+	if (clientside)		// server doesn't need to load patches ever
+	{
+		// Precalculate whatever possible.
+		for (int i = 0; i < numtextures; i++)
+			R_GenerateLookup(i, &errors);
+	}
+
+	if (errors)
+		PrintFmt(PRINT_WARNING, "{} errors encountered during texture generation.", errors);
+
+	// Create translation table for global animation.
+
+	texturetranslation = std::make_unique<int[]>(numtextures+1);
+
+	for (int i = 0; i < numtextures; i++)
+		texturetranslation[i] = i;
+}
+
+
+
+//
+// R_InitFlats
+//
+void R_InitFlats (void)
+{
+	firstflat = W_GetNumForName ("F_START") + 1;
+	lastflat = W_GetNumForName ("F_END") - 1;
+
+	if(firstflat >= lastflat)
+		I_Error("no flats");
+
+	numflats = lastflat - firstflat + 1;
+
+	delete[] flattranslation;
+
+	// Create translation table for global animation.
+	flattranslation = new int[numflats+1];
+
+	for (int i = 0; i < numflats; i++)
+		flattranslation[i] = i;
+
+	delete[] flatwarp;
+
+	flatwarp = new bool[numflats+1];
+	memset (flatwarp, 0, sizeof(bool) * (numflats+1));
+
+	delete[] warpedflats;
+
+	warpedflats = new byte *[numflats+1];
+	memset (warpedflats, 0, sizeof(byte *) * (numflats+1));
+
+	delete[] flatwarpedwhen;
+
+	flatwarpedwhen = new int[numflats+1];
+	memset (flatwarpedwhen, 0xff, sizeof(int) * (numflats+1));
+}
+
+
+//
+// R_InitSpriteLumps
+// Finds the width and hoffset of all sprites in the wad,
+//	so the sprite does not need to be cached completely
+//	just for having the header info ready during rendering.
+//
+void R_InitSpriteLumps (void)
+{
+	firstspritelump = W_GetNumForName ("S_START") + 1;
+	lastspritelump = W_GetNumForName ("S_END") - 1;
+
+	numspritelumps = lastspritelump - firstspritelump + 1;
+
+	if(firstspritelump > lastspritelump)
+		I_Error("no sprite lumps");
+
+	// [RH] Rather than maintaining separate spritewidth, spriteoffset,
+	//		and spritetopoffset arrays, this data has now been moved into
+	//		the sprite frame definition and gets initialized by
+	//		R_InstallSpriteLump(), so there really isn't anything to do here.
+}
+
+
+struct FakeCmap
+{
+	OLumpName name;
+	argb_t blend_color;
+};
+
+static FakeCmap* fakecmaps = NULL;
+
+size_t numfakecmaps;
+int firstfakecmap;
+shademap_t realcolormaps;
+
+
+void R_ForceDefaultColormap(const char* name)
+{
+	const byte* data = (byte*)W_CacheLumpName(name, PU_CACHE);
+	memcpy(realcolormaps.colormap, data, (NUMCOLORMAPS+1)*256);
+
+#if 0
+	// Setup shademap to mirror colormapped colors:
+	for (int m = 0; m < (NUMCOLORMAPS+1); ++m)
+		for (int c = 0; c < 256; ++c)
+			realcolormaps.shademap[m*256+c] = V_Palette.shade(realcolormaps.colormap[m*256+c]);
+#else
+	BuildDefaultShademap(V_GetDefaultPalette(), realcolormaps);
+#endif
+
+	fakecmaps[0].name = name;
+	fakecmaps[0].blend_color = argb_t(0, 255, 255, 255);
+}
+
+void R_SetDefaultColormap(const char* name)
+{
+	if (fakecmaps[0].name == name)
+		R_ForceDefaultColormap(name);
+}
+
+void R_ReinitColormap()
+{
+	if (fakecmaps == NULL)
+		return;
+
+	OLumpName name = fakecmaps[0].name;
+	if (name.empty())
+		name = "COLORMAP";
+
+	R_ForceDefaultColormap(name.c_str());
+}
+
+
+//
+// R_ShutdownColormaps
+//
+// Frees the memory allocated specifically for the colormaps.
+//
+void R_ShutdownColormaps()
+{
+	if (realcolormaps.colormap)
+	{
+		Z_Free(realcolormaps.colormap);
+		realcolormaps.colormap = NULL;
+	}
+
+	if (realcolormaps.shademap)
+	{
+		Z_Free(realcolormaps.shademap);
+		realcolormaps.shademap = NULL;
+	}
+
+	if (fakecmaps)
+	{
+		delete [] fakecmaps;
+		fakecmaps = NULL;
+	}
+}
+
+//
+// R_InitColormaps
+//
+void R_InitColormaps()
+{
+	// [RH] Try and convert BOOM colormaps into blending values.
+	//		This is a really rough hack, but it's better than
+	//		not doing anything with them at all (right?)
+	int lastfakecmap = W_CheckNumForName("C_END");
+	firstfakecmap = W_CheckNumForName("C_START");
+
+	if (firstfakecmap == -1 || lastfakecmap == -1)
+		numfakecmaps = 1;
+	else
+	{
+		if (firstfakecmap > lastfakecmap)
+			I_Error("no fake cmaps");
+
+		numfakecmaps = lastfakecmap - firstfakecmap;
+	}
+
+	realcolormaps.colormap = (byte*)Z_Malloc(256*(NUMCOLORMAPS+1)*numfakecmaps, PU_STATIC,0);
+	realcolormaps.shademap = (argb_t*)Z_Malloc(256*sizeof(argb_t)*(NUMCOLORMAPS+1)*numfakecmaps, PU_STATIC,0);
+
+	delete[] fakecmaps;
+	fakecmaps = new FakeCmap[numfakecmaps];
+
+	R_ForceDefaultColormap("COLORMAP");
+
+	if (numfakecmaps > 1)
+	{
+		const palette_t* pal = V_GetDefaultPalette();
+
+		for (unsigned i = ++firstfakecmap, j = 1; j < numfakecmaps; i++, j++)
+		{
+			if (W_LumpLength(i) >= (NUMCOLORMAPS+1)*256)
+			{
+				byte* map = (byte*)W_CacheLumpNum(i, PU_CACHE);
+				byte* colormap = realcolormaps.colormap+(NUMCOLORMAPS+1)*256*j;
+				argb_t* shademap = realcolormaps.shademap+(NUMCOLORMAPS+1)*256*j;
+
+				// Copy colormap data:
+				memcpy(colormap, map, (NUMCOLORMAPS+1)*256);
+
+				int r = pal->basecolors[*map].getr();
+				int g = pal->basecolors[*map].getg();
+				int b = pal->basecolors[*map].getb();
+
+				W_GetOLumpName(fakecmaps[j].name, i);
+
+				for (int k = 1; k < 256; k++)
+				{
+					r = (r + pal->basecolors[map[k]].getr()) >> 1;
+					g = (g + pal->basecolors[map[k]].getg()) >> 1;
+					b = (b + pal->basecolors[map[k]].getb()) >> 1;
+				}
+				// NOTE(jsd): This alpha value is used for 32bpp in water areas.
+				argb_t color = argb_t(64, r, g, b);
+				fakecmaps[j].blend_color = color;
+
+				// Set up shademap for the colormap:
+				for (int k = 0; k < 256; ++k)
+					shademap[k] = alphablend1a(pal->basecolors[map[0]], color, j * (256 / numfakecmaps));
+			}
+		}
+	}
+}
+
+//
+// R_ColormapNumForname
+//
+// [RH] Returns an index into realcolormaps. Multiply it by
+//		256*(NUMCOLORMAPS+1) to find the start of the colormap to use.
+//
+// COLORMAP always returns 0.
+//
+int R_ColormapNumForName(const char* name)
+{
+	if (strnicmp(name, "COLORMAP", 8) != 0)
+	{
+		int lump = W_CheckNumForName(name, ns_colormaps);
+
+		if (lump != -1)
+			return lump - firstfakecmap + 1;
+	}
+
+	return 0;
+}
+
+
+//
+// R_BlendForColormap
+//
+// Returns a blend value to approximate the given colormap index number.
+// Invalid values return the color white with 0% opacity.
+//
+argb_t R_BlendForColormap(unsigned int index)
+{
+	if (index > 0 && index < numfakecmaps)
+		return fakecmaps[index].blend_color;
+
+	return argb_t(0, 255, 255, 255);
+}
+
+
+//
+// R_ColormapForBlend
+//
+// Returns the colormap index number that has the given blend color value.
+//
+int R_ColormapForBlend(const argb_t blend_color)
+{
+	for (unsigned int i = 1; i < numfakecmaps; i++)
+		if (fakecmaps[i].blend_color == blend_color)
+			return i;
+	return 0;
+}
+
+//
+// R_InitData
+// Locates all the lumps
+//	that will be used by all views
+// Must be called after W_Init.
+//
+void R_InitData()
+{
+	R_InitTextures();
+	R_InitFlats();
+	R_InitSpriteLumps();
+	R_InitSkyDefs();
+
+	// haleyjd 01/28/10: also initialize tantoangle_acc table
+	Table_InitTanToAngle();
+}
+
+
+
+//
+// R_FlatNumForName
+// Retrieval, get a flat number for a flat name.
+//
+int R_FlatNumForName (const char* name)
+{
+	int i = W_CheckNumForName (name, ns_flats);
+
+	if (i == -1)	// [RH] Default flat for not found ones
+		i = W_CheckNumForName ("-NOFLAT-", ns_flats);
+
+	if (i == -1) {
+		char namet[9];
+
+		strncpy (namet, name, 8);
+		namet[8] = 0;
+
+		I_Error("R_FlatNumForName: {} not found", namet);
+	}
+
+	return i - firstflat;
+}
+
+
+
+
+//
+// R_CheckTextureNumForName
+// Check whether texture is available.
+// Filter out NoTexture indicator.
+//
+int R_CheckTextureNumForName (const OLumpName& name)
+{
+	// "NoTexture" marker.
+	if (name[0] == '-')
+		return 0;
+
+	// [RH] Use a hash table instead of linear search
+	auto it = texturehash.find(name);
+	if (it == texturehash.end())
+		return -1;
+
+	return it->second;
+}
+
+
+
+//
+// R_TextureNumForName
+// Calls R_CheckTextureNumForName,
+//	aborts with error message.
+//
+int R_TextureNumForName (const OLumpName& name)
+{
+	const int i = R_CheckTextureNumForName (name);
+
+	if (i == -1)
+	{
+		//I_Error ("R_TextureNumForName: %s not found", namet);
+		// [RH] Return empty texture if it wasn't found.
+		if (name == "")
+			PrintFmt(PRINT_WARNING, "Unnamed texture not found\n");
+		else
+			PrintFmt(PRINT_WARNING, "Texture {} not found\n", name);
+		return 0;
+	}
+
+	return i;
+}
+
+
+
+
+//
+// R_PrecacheLevel
+// Preloads all relevant graphics for the level.
+//
+// [RH] Rewrote this using Lee Killough's code in BOOM as an example.
+
+void R_PrecacheLevel (void)
+{
+	std::unique_ptr<byte[]> hitlist;
+
+	if (demoplayback)
+		return;
+
+	{
+		int size = (numflats > numsprites) ? numflats : numsprites;
+
+		hitlist = std::make_unique<byte[]>((numtextures > size) ? numtextures : size);
+	}
+
+	// Precache flats.
+	memset (hitlist.get(), 0, numflats);
+
+	for (int i = numsectors - 1; i >= 0; i--)
+		hitlist[sectors[i].floorpic] = hitlist[sectors[i].ceilingpic] = 1;
+
+	for (int i = numflats - 1; i >= 0; i--)
+		if (hitlist[i])
+			W_CacheLumpNum (firstflat + i, PU_CACHE);
+
+	std::vector<int> skytextures;
+	#ifdef CLIENT_APP
+	R_ActivateSkies(hitlist.get(), skytextures);
+	#endif
+
+	// Precache textures.
+	memset (hitlist.get(), 0, numtextures);
+
+	for (int i = numsides - 1; i >= 0; i--)
+	{
+		hitlist[sides[i].toptexture] =
+			hitlist[sides[i].midtexture] =
+			hitlist[sides[i].bottomtexture] = 1;
+	}
+
+	// Sky texture is always present.
+	// Note that F_SKY1 is the name used to
+	//	indicate a sky floor/ceiling as a flat,
+	//	while the sky texture is stored like
+	//	a wall texture, with an episode dependend
+	//	name.
+	//
+	// [RH] Possibly two sky textures now.
+	// [ML] 5/11/06 - Not anymore!
+
+	hitlist[sky2texture] = 1;
+
+	for (int skytexture : skytextures)
+	{
+		hitlist[skytexture] = 1;
+	}
+
+	for (int i = numtextures - 1; i >= 0; i--)
+	{
+		if (hitlist[i])
+		{
+			int j;
+			texture_t *texture = textures[i];
+
+			for (j = texture->patchcount - 1; j > 0; j--)
+				W_CachePatch(texture->patches[j].patch, PU_CACHE);
+		}
+	}
+
+	// Precache sprites.
+	{
+		AActor *actor;
+		TThinkerIterator<AActor> iterator;
+		std::unordered_set<int32_t> spriteHitlist;
+
+		// generate a unique list of all the sprites we hit in this level
+		while ( (actor = iterator.Next ()) )
+		{
+			// [CMB] spritenum_t can now be negative so a new structure is needed
+			// [CMB] sprites is a pointer in order by index
+			spriteHitlist.insert(actor->sprite);
+		}
+
+		// cache each of the sprites
+		for (auto sprite : spriteHitlist)
+		{
+			R_CacheSprite (&sprites[sprite]);
+		}
+	}
+}
+
+// Utility function,
+//	called by R_PointToAngle.
+unsigned int SlopeDiv (unsigned int num, unsigned int den)
+{
+	unsigned int ans;
+
+	if (den < 512)
+		return SLOPERANGE;
+
+	ans = (num << 3) / (den >> 8);
+
+	return ans <= SLOPERANGE ? ans : SLOPERANGE;
+}
+
+VERSION_CONTROL (r_data_cpp, "$Id: 0aceb9f0f9b6e48ecea9ffdc19f623e05e10267c $")

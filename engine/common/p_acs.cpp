@@ -1,0 +1,4650 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: fb40577391819ee1b44c13023c84c33857d2ccfc $
+//
+// Copyright (C) 1998-2006 by Randy Heit (ZDoom).
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	[RH] p_acs.c: New file to handle ACS scripts
+//
+//-----------------------------------------------------------------------------
+
+
+#include "odamex.h"
+
+#include "z_zone.h"
+#include "p_local.h"
+#include "p_spec.h"
+#include "s_sound.h"
+#include "p_acs.h"
+#include "p_saveg.h"
+#include "p_lnspec.h"
+#include "m_random.h"
+#include "c_console.h"
+#include "c_dispatch.h"
+#include "s_sndseq.h"
+#include "i_system.h"
+#include "m_vectors.h"
+#include "p_inter.h"
+#include "gi.h"
+#include "g_skill.h"
+#include "infomap.h"
+#include "p_mobj.h"
+#include "r_sky.h"
+#include "c_effect.h"
+
+#if defined(SERVER_APP)
+#include "sv_main.h"
+#endif
+
+#define CLAMPCOLOR(c)	(EColorRange)((unsigned)(c)>CR_UNTRANSLATED?CR_UNTRANSLATED:(c))
+#define LANGREGIONMASK	MAKE_ID(0,0,0xff,0xff)
+
+struct CallReturn
+{
+	int ReturnAddress;
+	ScriptFunction *ReturnFunction;
+	byte bDiscardResult;
+	byte Pad[3];
+};
+
+struct FBehavior::ArrayInfo
+{
+	int ArraySize;
+	int32_t *Elements;
+};
+
+ItemEquipVal P_GiveAmmo(player_t *player, ammotype_t ammo, float num);
+ItemEquipVal P_GiveWeapon(player_t *player, weapontype_t weapon, bool dropped);
+ItemEquipVal P_GiveCard(player_t *player, card_t card);
+ItemEquipVal P_GivePower(player_t *player, int  power);
+
+AActor* P_FindThingById(uint32_t id);
+void P_SwitchWeapon(player_t& player);
+bool P_CheckAmmo (player_t& player);
+
+namespace
+{
+
+std::array<int, STACK_SIZE> Stack;
+
+bool P_GetScriptGoing (AActor *who, line_t *where, int num, int *code,
+	int lineSide, int arg0, int arg1, int arg2, int always, bool delay);
+
+void DoClearInv(player_t* player)
+{
+	player->weaponowned.fill(false);
+	player->powers.fill(0);
+	player->cards.fill(false);
+	player->ammo.fill(0);
+
+	if (player->backpack)
+	{
+		player->backpack = false;
+		for (int i = 0; i < NUMAMMO; i++)
+		{
+			player->maxammo[i] /= 2;
+		}
+	}
+
+	player->pendingweapon = NUMWEAPONS;
+
+	SERVER_ONLY(
+	    SV_ACSExecuteSpecial(DLevelScript::PCD_CLEARINVENTORY, player->mo, NULL, true));
+}
+
+void ClearInventory(AActor* activator)
+{
+	if (activator == NULL)
+	{
+		for (auto& player : players)
+		{
+			if (player.ingame() && !player.spectator)
+			{
+				DoClearInv(&player);
+				SERVER_ONLY(SV_SendPlayerInfo(player));
+			}
+		}
+	}
+	else if (activator->player != NULL)
+	{
+		DoClearInv(activator->player);
+		SERVER_ONLY(SV_SendPlayerInfo(*(activator->player)));
+	}
+}
+
+void GiveBackpack(player_t& player)
+{
+	if (!player.backpack)
+	{
+		for (auto& ammo : player.maxammo)
+		{
+			ammo *= 2;
+		}
+		player.backpack = true;
+	}
+	for (int i = 0; i < NUMAMMO; i++)
+	{
+		P_GiveAmmo(player, static_cast<ammotype_t>(i), 1);
+	}
+	SERVER_ONLY(SV_SendPlayerInfo(player));
+}
+
+void DoGiveInv(player_t& player, const char* type, int amount)
+{
+	const weapontype_t savedpendingweap = player.pendingweapon;
+
+	// Give weapon
+	// Needs separate handling because fist/pistol have no mobjtype
+	const weapontype_t weapon = P_INameToWeapon(type);
+	if (weapon != wp_none)
+	{
+		do
+		{
+			P_GiveWeapon(player, weapon, false);
+		}
+		while (--amount > 0);
+
+		// Don't bring it up automatically
+		if (player.readyweapon != NUMWEAPONS && player.pendingweapon != NUMWEAPONS)
+			player.pendingweapon = savedpendingweap;
+		SERVER_ONLY(SV_SendPlayerInfo(player));
+		return;
+	}
+
+	const auto [_, givetype] = P_INameToMobjFull(type);
+	if (!givetype)
+	{
+		DPrintFmt("ACS: LOGIC ERROR - Could not give {}\n", type);
+		return;
+	}
+
+	std::visit(OUtil::visitor {
+		[&](const card_t card) {
+			do
+			{
+				P_GiveCard(player, card);
+			}
+			while (--amount > 0);
+			SERVER_ONLY(SV_SendPlayerInfo(player));
+		},
+		[&](const ammotype_t ammo) {
+			player.ammo[ammo] = MIN(player.ammo[ammo]+amount, player.maxammo[ammo]);
+			SERVER_ONLY(SV_SendPlayerInfo(player));
+		},
+		[&](const powertype_t power) {
+			// TODO: check if do-while is correct here
+			do
+			{
+				P_GivePower(player, power);
+			}
+			while (--amount > 0);
+			SERVER_ONLY(SV_SendPlayerInfo(player));
+		},
+		[&](const infomap::backpack_t) {
+			do
+			{
+				GiveBackpack(player);
+			}
+			while (--amount > 0);
+			SERVER_ONLY(SV_SendPlayerInfo(player));
+		},
+		[](const weapontype_t) {
+			// already handled above, do nothing
+		}
+	}, *givetype);
+}
+
+void GiveInventory(AActor* activator, const char* type, int amount)
+{
+	if (activator == NULL)
+	{
+		for (int i = 0; i < MAXPLAYERS; ++i)
+		{
+			for (auto& player : players)
+			{
+				if (player.ingame() && !player.spectator)
+					DoGiveInv(player, type, amount);
+			}
+		}
+	}
+	else if (activator->player != NULL)
+	{
+		DoGiveInv(*activator->player, type, amount);
+	}
+}
+
+void TakeWeapon(player_t& player, int weapon)
+{
+	player.weaponowned[weapon] = false;
+	if (player.readyweapon == weapon || player.pendingweapon == weapon)
+	{
+		P_SwitchWeapon(player);
+
+		bool hasWeapon = false;
+		for (int i = 0; i < NUMWEAPONS; i++)
+		{
+			if (player.weaponowned[i])
+			{
+				hasWeapon = true;
+				break;
+			}
+		}
+
+		if (!hasWeapon)
+			player.pendingweapon = NUMWEAPONS;
+	}
+	SERVER_ONLY(SV_SendPlayerInfo(player));
+}
+
+void TakeAmmo(player_t& player, int ammo, int amount)
+{
+	if (amount == 0)
+	{
+		player.ammo[ammo] = 0;
+	}
+	else
+	{
+		player.ammo[ammo] = MAX(player.ammo[ammo]-amount, 0);
+	}
+	if (player.pendingweapon != wp_nochange)
+	{
+		// Make sure we have the ammo for the weapon being switched to
+		weapontype_t readynow = player.readyweapon;
+		player.readyweapon = player.pendingweapon;
+		player.pendingweapon = wp_nochange;
+		if (P_CheckAmmo(player))
+		{
+			// There was enough ammo for the pending weapon, so keep switching
+			player.pendingweapon = player.readyweapon;
+			player.readyweapon = readynow;
+		}
+		else
+		{
+			player.pendingweapon = player.readyweapon = readynow;
+			P_CheckAmmo(player);
+		}
+	}
+	else
+	{
+		// Make sure we still have enough ammo for the current weapon
+		P_CheckAmmo(player);
+	}
+	SERVER_ONLY(SV_SendPlayerInfo(player));
+}
+
+AActor* SingleActorFromTID(int tid, AActor* defactor)
+{
+	if (tid == 0)
+	{
+		return defactor;
+	}
+	else
+	{
+		FActorIterator iterator(tid);
+		return iterator.Next();
+	}
+}
+
+void TakeBackpack(player_t& player)
+{
+	if (!player.backpack)
+		return;
+
+	player.backpack = false;
+	for (int i = 0; i < NUMAMMO; ++i)
+	{
+		player.maxammo[i] /= 2;
+		player.ammo[i] = std::min(player.ammo[i], player.maxammo[i]);
+	}
+	SERVER_ONLY(SV_SendPlayerInfo(player));
+}
+
+void DoTakeInv(player_t& player, const char* type, int amount)
+{
+	const weapontype_t weapon = P_INameToWeapon(type);
+	if (weapon != wp_none)
+	{
+			TakeWeapon(player, weapon);
+			return;
+	}
+
+	const auto [_, givetype] = P_INameToMobjFull(type);
+	if (!givetype)
+	{
+		DPrintFmt("ACS: LOGIC ERROR - Could not take {}\n", type);
+		return;
+	}
+
+	std::visit(OUtil::visitor {
+		[&](const card_t card) {
+			player.cards[card] = false;
+			SERVER_ONLY(SV_SendPlayerInfo(player));
+		},
+		[&](const ammotype_t ammo) {
+			TakeAmmo(player, ammo, amount);
+		},
+		[&](const powertype_t power) {
+			// TODO: implement this
+			PrintFmt("Taking powerups is not yet supported\n");
+		},
+		[&](const infomap::backpack_t) {
+			// TODO: Eternity uses the amount, check if this applies to ZDoom too
+			// see https://eternity.youfailit.net/wiki/TakeInventory
+			TakeBackpack(player);
+		},
+		[](const weapontype_t) {
+			// already handled above, do nothing
+		}
+	}, *givetype);
+
+	// TODO: Eternity allows taking health, check if this applies to ZDoom too
+}
+
+void TakeInventory(AActor* activator, const char* type, int amount)
+{
+	if (activator == nullptr)
+	{
+		for (auto& player : players)
+		{
+			if (player.ingame() && !player.spectator)
+				DoTakeInv(player, type, amount);
+		}
+	}
+	else if (activator->player != nullptr)
+	{
+		DoTakeInv(*activator->player, type, amount);
+	}
+}
+
+int CheckInventory(AActor* activator, const char* type)
+{
+	if (activator == nullptr || activator->player == nullptr)
+		return 0;
+
+	const player_t& player = *activator->player;
+
+	const weapontype_t weapon = P_INameToWeapon(type);
+	if (weapon != wp_none)
+	{
+		return player.weaponowned[weapon] ? 1 : 0;
+	}
+
+	const auto [_, givetype] = P_INameToMobjFull(type);
+	if (!givetype)
+	{
+		DPrintFmt("ACS: LOGIC ERROR - Could not check {}\n", type);
+		return 0;
+	}
+
+	return std::visit(OUtil::visitor {
+		[&](const card_t card) {
+			return player.cards[card] ? 1 : 0;
+		},
+		[&](const ammotype_t ammo) {
+			return player.ammo[ammo];
+		},
+		[&](const powertype_t power) {
+			// TODO: implement this
+			PrintFmt("Checking powerups is not yet supported\n");
+			return 0;
+		},
+		[&](const infomap::backpack_t) {
+			return player.backpack ? 1 : 0;
+		},
+		[](const weapontype_t) {
+			// already handled above, do nothing
+			return 0;
+		}
+	}, *givetype);
+}
+
+int16_t StrToMOD(const char* str)
+{
+	// TODO: find out whether this is supposed to be case sensitive
+	using OUtil::CONST_HASH_NO_CASE;
+	switch (CONST_HASH_NO_CASE(str))
+	{
+		default:
+		case CONST_HASH_NO_CASE("Ice"):
+		case CONST_HASH_NO_CASE("Disintegrate"):
+		case CONST_HASH_NO_CASE("Poison"):
+		case CONST_HASH_NO_CASE("Electric"):
+		case CONST_HASH_NO_CASE("Massacre"):
+		case CONST_HASH_NO_CASE("None"):
+			return MOD_UNKNOWN;
+		case CONST_HASH_NO_CASE("BFGSplash"):
+			return MOD_BFG_SPLASH;
+		case CONST_HASH_NO_CASE("Drowning"):
+			return MOD_WATER;
+		case CONST_HASH_NO_CASE("Slime"):
+			return MOD_SLIME;
+		case CONST_HASH_NO_CASE("Fire"):
+			return MOD_LAVA;
+		case CONST_HASH_NO_CASE("Crush"):
+			return MOD_CRUSH;
+		case CONST_HASH_NO_CASE("Telefrag"):
+			return MOD_TELEFRAG;
+		case CONST_HASH_NO_CASE("Falling"):
+			return MOD_FALLING;
+		case CONST_HASH_NO_CASE("Suicide"):
+			return MOD_SUICIDE;
+		case CONST_HASH_NO_CASE("Exit"):
+			return MOD_EXIT;
+		case CONST_HASH_NO_CASE("Melee"):
+			return MOD_HIT;
+		case CONST_HASH_NO_CASE("Railgun"):
+			return MOD_RAILGUN;
+	}
+}
+
+} // namespace
+
+EXTERN_CVAR (sv_skill)
+EXTERN_CVAR (sv_gametype)
+
+//---- ACS lump manager ----//
+
+FBehavior::FBehavior (byte* object, int len)
+: Chunks(nullptr), Scripts(nullptr), NumScripts(0),
+  Functions(nullptr), NumFunctions(0), ScriptFlags(nullptr), NumScriptFlags(0),
+  Arrays(nullptr), NumArrays(0)
+{
+
+	if (object[0] != 'A' || object[1] != 'C' || object[2] != 'S')
+	{
+		Format = ACS_Unknown;
+		return;
+	}
+
+	switch (object[3])
+	{
+	case 0:
+		Format = ACS_Old;
+		break;
+	case 'E':
+		Format = ACS_Enhanced;
+		break;
+	case 'e':
+		Format = ACS_LittleEnhanced;
+		break;
+	default:
+		Format = ACS_Unknown;
+		return;
+	}
+
+	Data = object;
+	DataSize = len;
+
+	if (Format == ACS_Old)
+	{
+		Chunks = object + len;
+		Scripts = object + ((uint32_t *)object)[1];
+		NumScripts = ((uint32_t *)Scripts)[0];
+		// Check for redesigned ACSE/ACSe
+		if (((uint32_t *)object)[1] >= 6*4 &&
+			(((uint32_t *)Scripts)[-1] == MAKE_ID('A','C','S','e') ||
+			((uint32_t *)Scripts)[-1] == MAKE_ID('A','C','S','E')))
+		{
+			Format = (((byte *)Scripts)[-1] == 'e') ? ACS_LittleEnhanced : ACS_Enhanced;
+			Chunks = object + ((uint32_t *)Scripts)[-2];
+			// Forget about the compatibility cruft at the end of the lump
+			DataSize = ((uint32_t *)object)[1] - 8;
+		}
+		else
+		{
+			Scripts += 4;
+			for (int i = 0; i < NumScripts; ++i)
+			{
+				ScriptPtr2 ptr1 = *(ScriptPtr2 *)(Scripts + 12*i);
+				ScriptPtr *ptr2 =  (ScriptPtr  *)(Scripts +  8*i);
+				ptr2->Number = ptr1.Number % 1000;
+				ptr2->Type = ptr1.Number / 1000;
+				ptr2->ArgCount = ptr1.ArgCount;
+				ptr2->Address = ptr1.Address;
+			}
+		}
+	}
+	else
+	{
+		Chunks = object + ((uint32_t *)object)[1];
+	}
+	if (Format != ACS_Old)
+	{
+		Scripts = FindChunk (MAKE_ID('S','P','T','R'));
+		if (object[3] != 0)
+		{
+			NumScripts = ((uint32_t *)Scripts)[1] / 12;
+			Scripts += 8;
+			for (int i = 0; i < NumScripts; ++i)
+			{
+				ScriptPtr1 ptr1 = *(ScriptPtr1 *)(Scripts + 12*i);
+				ScriptPtr *ptr2 =  (ScriptPtr  *)(Scripts +  8*i);
+				ptr2->Number = ptr1.Number;
+				ptr2->Type = ptr1.Type;
+				ptr2->ArgCount = ptr1.ArgCount;
+				ptr2->Address = ptr1.Address;
+			}
+		}
+		else
+		{
+			NumScripts = ((uint32_t *)Scripts)[1] / 8;
+			Scripts += 8;
+		}
+	}
+
+	// Sort scripts, so we can use a binary search to find them
+	if (NumScripts > 0)
+	{
+		// TODO: make it possible to replace with std::sort
+		qsort (Scripts, NumScripts, 8, SortScripts);
+	}
+
+	if (Format == ACS_Old)
+	{
+		LanguageNeutral = ((uint32_t *)Data)[1];
+		LanguageNeutral += ((uint32_t *)(Data + LanguageNeutral))[0] * 12 + 4;
+	}
+	else
+	{
+		LanguageNeutral = FindLanguage (0, false);
+		PrepLocale (LanguageIDs[0], LanguageIDs[1], LanguageIDs[2], LanguageIDs[3]);
+	}
+
+	if (Format != ACS_Old)
+	{
+		uint32_t *chunk;
+
+		Functions = FindChunk(MAKE_ID('F','U','N','C'));
+		if (Functions != NULL)
+		{
+			NumFunctions = LELONG(((uint32_t *)Functions)[1]);
+			Functions += 8;
+		}
+
+		// Per-script flags (clientside etc)
+		ScriptFlags = FindChunk(MAKE_ID('S','F','L','G'));
+		if (ScriptFlags != NULL)
+		{
+			NumScriptFlags = LELONG(((uint32_t *)ScriptFlags)[1]) / 4;
+			ScriptFlags += 8;
+		}
+
+		chunk = (uint32_t *)FindChunk(MAKE_ID('M','I','N','I'));
+		if (chunk != NULL)
+		{
+			int numvars = LELONG(chunk[1])/4;
+			int firstvar = LELONG(chunk[2]);
+			for (int i = 0; i < numvars; ++i)
+			{
+				level.vars[i+firstvar] = LELONG(chunk[3+i]);
+			}
+		}
+
+		chunk = (uint32_t *)FindChunk(MAKE_ID('A','R','A','Y'));
+		if (chunk != NULL)
+		{
+			NumArrays = LELONG(chunk[1])/8;
+			Arrays = new ArrayInfo[NumArrays];
+			memset (Arrays, 0, sizeof(*Arrays)*NumArrays);
+			for (int i = 0; i < NumArrays; ++i)
+			{
+				level.vars[LELONG(chunk[2+i*2])] = i;
+				Arrays[i].ArraySize = LELONG(chunk[3+i*2]);
+				Arrays[i].Elements = new int32_t[Arrays[i].ArraySize];
+				memset(Arrays[i].Elements, 0, Arrays[i].ArraySize*sizeof(uint32_t));
+			}
+		}
+
+		chunk = (uint32_t *)FindChunk(MAKE_ID('A','I','N','I'));
+		while (chunk != NULL)
+		{
+			int arraynum = level.vars[LELONG(chunk[2])];
+			if ((unsigned)arraynum < (unsigned)NumArrays)
+			{
+				int initsize = MIN<int> (Arrays[arraynum].ArraySize, (LELONG(chunk[1])-4)/4);
+				int32_t *elems = Arrays[arraynum].Elements;
+				for (int i = 0; i < initsize; ++i)
+				{
+					elems[i] = LELONG(chunk[3+i]);
+				}
+			}
+			chunk = (uint32_t *)NextChunk((byte *)chunk);
+		}
+	}
+
+	DPrintFmt("Loaded {} scripts, {} Functions\n", NumScripts, NumFunctions);
+}
+
+FBehavior::~FBehavior ()
+{
+	// Object file is freed by the zone heap
+	if(Arrays != NULL)
+	{
+		for (int i = 0; i < NumArrays; ++i)
+		{
+			if (Arrays[i].Elements != NULL)
+			{
+				delete[] Arrays[i].Elements;
+				Arrays[i].Elements = NULL;
+			}
+		}
+		delete[] Arrays;
+		Arrays = NULL;
+	}
+}
+
+int FBehavior::SortScripts (const void *a, const void *b)
+{
+	ScriptPtr *ptr1 = (ScriptPtr *)a;
+	ScriptPtr *ptr2 = (ScriptPtr *)b;
+	return ptr1->Number - ptr2->Number;
+}
+
+bool FBehavior::IsGood ()
+{
+	return Format != ACS_Unknown;
+}
+
+int *FBehavior::FindScript (int script) const
+{
+	const ScriptPtr *ptr = BinarySearch<ScriptPtr, uint16_t>
+		((ScriptPtr *)Scripts, NumScripts, &ScriptPtr::Number, (uint16_t)script);
+
+	return ptr ? (int *)(ptr->Address + Data) : NULL;
+}
+
+ScriptFunction *FBehavior::GetFunction (int funcnum) const
+{
+	if ((unsigned)funcnum >= (unsigned)NumFunctions)
+	{
+		return NULL;
+	}
+	return (ScriptFunction *)Functions + funcnum;
+}
+
+int FBehavior::GetArrayVal (int arraynum, int index) const
+{
+	if ((unsigned)arraynum >= (unsigned)NumArrays)
+		return 0;
+	const ArrayInfo *array = &Arrays[arraynum];
+	if ((unsigned)index >= (unsigned)array->ArraySize)
+		return 0;
+	return array->Elements[index];
+}
+
+void FBehavior::SetArrayVal (int arraynum, int index, int value)
+{
+	if ((unsigned)arraynum >= (unsigned)NumArrays)
+		return;
+	const ArrayInfo *array = &Arrays[arraynum];
+	if ((unsigned)index >= (unsigned)array->ArraySize)
+		return;
+	array->Elements[index] = value;
+}
+
+byte *FBehavior::FindChunk (uint32_t id) const
+{
+	byte *chunk = Chunks;
+
+	while (chunk != NULL && chunk < Data + DataSize)
+	{
+		if (((uint32_t *)chunk)[0] == id)
+		{
+			return chunk;
+		}
+		chunk += ((uint32_t *)chunk)[1] + 8;
+	}
+	return NULL;
+}
+
+byte *FBehavior::NextChunk (byte *chunk) const
+{
+	uint32_t id = *(uint32_t *)chunk;
+	chunk += ((uint32_t *)chunk)[1] + 8;
+	while (chunk != NULL && chunk < Data + DataSize)
+	{
+		if (((uint32_t *)chunk)[0] == id)
+		{
+			return chunk;
+		}
+		chunk += ((uint32_t *)chunk)[1] + 8;
+	}
+	return NULL;
+}
+
+const char *FBehavior::LookupString (uint32_t index, uint32_t ofs) const
+{
+	if (Format == ACS_Old)
+	{
+		uint32_t *list = (uint32_t *)(Data + LanguageNeutral);
+
+		if (index >= list[0])
+			return NULL;	// Out of range for this list;
+		return (const char *)(Data + list[1+index]);
+	}
+	else
+	{
+		if (ofs == 0)
+		{
+			ofs = LanguageNeutral;
+			if (ofs == 0)
+			{
+				return NULL;
+			}
+		}
+		uint32_t *list = (uint32_t *)(Data + ofs);
+
+		if (index >= list[1])
+			return NULL;	// Out of range for this list
+		if (list[3+index] == 0)
+			return NULL;	// Not defined in this list
+		return (const char *)(Data + ofs + list[3+index]);
+	}
+}
+
+const char *FBehavior::LocalizeString (uint32_t index) const
+{
+	if (Format != ACS_Old)
+	{
+		uint32_t ofs = Localized;
+		const char *str = NULL;
+
+		while (ofs != 0 && (str = LookupString (index, ofs)) == NULL)
+		{
+			ofs = ((uint32_t *)(Data + ofs))[2];
+		}
+		return str;
+	}
+	else
+	{
+		return LookupString (index);
+	}
+}
+
+void FBehavior::PrepLocale (uint32_t userpref, uint32_t userdef, uint32_t syspref, uint32_t sysdef)
+{
+	// Clear away any existing links
+	for (byte* chunk = Chunks; chunk < Data + DataSize; chunk += ((uint32_t *)chunk)[1] + 8)
+	{
+		uint32_t* list = (uint32_t *)chunk;
+		if (list[0] == MAKE_ID('S','T','R','L'))
+		{
+			list[4] = 0;
+		}
+	}
+	Localized = 0;
+
+	if (userpref)
+		AddLanguage (userpref);
+	if (userpref & LANGREGIONMASK)
+		AddLanguage (userpref & ~LANGREGIONMASK);
+	if (userdef)
+		AddLanguage (userdef);
+	if (userdef & LANGREGIONMASK)
+		AddLanguage (userdef & ~LANGREGIONMASK);
+	if (syspref)
+		AddLanguage (syspref);
+	if (syspref & LANGREGIONMASK)
+		AddLanguage (syspref & ~LANGREGIONMASK);
+	if (sysdef)
+		AddLanguage (sysdef);
+	if (sysdef & LANGREGIONMASK)
+		AddLanguage (sysdef & ~LANGREGIONMASK);
+	AddLanguage (MAKE_ID('e','n',0,0));		// Use English as a fallback
+	AddLanguage (0);			// Failing that, use language independent strings
+}
+
+void FBehavior::AddLanguage (uint32_t langid)
+{
+	// First, make sure language is not already inserted
+	uint32_t* ofsput = CheckIfInList (langid);
+	if (ofsput == NULL)
+	{ // Already in list
+		return;
+	}
+
+	// Try to find an exact match first
+	uint32_t ofs = FindLanguage (langid, false);
+	if (ofs != 0)
+	{
+		*ofsput = ofs;
+		return;
+	}
+
+	// If langid has no sublanguage, add all languages that match the major
+	// type, if not in list already
+	if ((langid & LANGREGIONMASK) == 0)
+	{
+		for (byte* chunk = Chunks; chunk < Data + DataSize; chunk += ((uint32_t *)chunk)[1] + 8)
+		{
+			uint32_t* list = (uint32_t *)chunk;
+			if (list[0] != MAKE_ID('S','T','R','L'))
+				continue;	// not a string list
+			if ((list[2] & ~LANGREGIONMASK) != langid)
+				continue;	// wrong language
+			if (list[4] != 0)
+				continue;	// definitely in language list
+			ofsput = CheckIfInList (list[2]);
+			if (ofsput != NULL)
+				*ofsput = chunk - Data + 8;	// add to language list
+		}
+	}
+}
+
+uint32_t *FBehavior::CheckIfInList (uint32_t langid)
+{
+	uint32_t ofs, *ofsput;
+	uint32_t *list;
+
+	ofs = Localized;
+	ofsput = &Localized;
+	while (ofs != 0)
+	{
+		list = (uint32_t *)(Data + ofs);
+		if (list[0] == langid)
+			return NULL;
+		ofsput = &list[2];
+		ofs = list[2];
+	}
+	return ofsput;
+}
+
+uint32_t FBehavior::FindLanguage (uint32_t langid, bool ignoreregion) const
+{
+	byte *chunk;
+	uint32_t *list;
+
+	const uint32_t langmask = ignoreregion ? ~LANGREGIONMASK : ~0;
+
+	for (chunk = Chunks; chunk < Data + DataSize; chunk += ((uint32_t *)chunk)[1] + 8)
+	{
+		list = (uint32_t *)chunk;
+		if (list[0] == MAKE_ID('S','T','R','L') && (list[2] & langmask) == langid)
+		{
+			return chunk - Data + 8;
+		}
+	}
+	return 0;
+}
+
+bool FBehavior::IsScriptClientside (int number) const
+{
+	if (ScriptFlags == NULL)
+		return false;
+
+	const uint16_t *flags = (const uint16_t *)ScriptFlags;
+	for (int i = 0; i < NumScriptFlags; ++i)
+	{
+		if (LESHORT(flags[i*2]) == (uint16_t)number)
+			return (LESHORT(flags[i*2+1]) & SCRIPTF_ClientSide) != 0;
+	}
+
+	return false;
+}
+
+void FBehavior::StartTypedScripts (uint16_t type, AActor *activator, int arg0, int arg1, int arg2, bool always) const
+{
+	ScriptPtr *ptr;
+
+	for (int i = 0; i < NumScripts; ++i)
+	{
+		ptr = (ScriptPtr *)(Scripts + 8*i);
+		if (ptr->Type != type)
+			continue;
+
+		if (IsScriptClientside(ptr->Number))
+		{
+			if (!clientside)
+				continue;
+		}
+		else if (!serverside)
+		{
+			continue;
+		}
+
+		P_GetScriptGoing (activator, NULL, ptr->Number,
+			(int *)(ptr->Address + Data), 0, arg0, arg1, arg2, always, true);
+	}
+}
+
+//---- The ACS Interpreter ----//
+
+
+
+#define NEXTWORD	(LELONG(*pc++))
+#define NEXTSHORT	(fmt==ACS_LittleEnhanced?getshort(pc):NEXTWORD)
+#define NEXTBYTE	(fmt==ACS_LittleEnhanced?getbyte(pc):NEXTWORD)
+#define STACK(a)	(Stack[sp - (a)])
+#define PushToStack(a)	(Stack[sp++] = (a))
+
+void strbin (char *str);
+
+IMPLEMENT_SERIAL (DACSThinker, DThinker)
+
+DACSThinker *DACSThinker::ActiveThinker = NULL;
+
+DACSThinker::DACSThinker ()
+{
+	if (ActiveThinker)
+	{
+		I_Error("Only one ACSThinker is allowed to exist at a time.\nCheck your code.");
+	}
+	else
+	{
+		ActiveThinker = this;
+		Scripts = nullptr;
+		LastScript = nullptr;
+		RunningScripts.fill(nullptr);
+	}
+}
+
+DACSThinker::~DACSThinker ()
+{
+	DLevelScript *script = Scripts;
+	while (script)
+	{
+		DLevelScript *next = script->next;
+		script->Destroy ();
+		script = next;
+	}
+	Scripts = NULL;
+	ActiveThinker = NULL;
+}
+
+void DACSThinker::Serialize (FArchive &arc)
+{
+	if (arc.IsStoring ())
+	{
+		arc << Scripts << LastScript;
+		for (int i = 0; i < 1000; i++)
+		{
+			if (RunningScripts[i])
+				arc << RunningScripts[i] << (uint16_t)i;
+		}
+		arc << static_cast<DLevelScript*>(nullptr);
+	}
+	else
+	{
+		arc >> Scripts >> LastScript;
+
+		uint16_t scriptnum;
+		DLevelScript *script;
+		arc >> script;
+		while (script)
+		{
+			arc >> scriptnum;
+			RunningScripts[scriptnum] = script;
+			arc >> script;
+		}
+	}
+}
+
+void DACSThinker::RunThink ()
+{
+	DLevelScript *script = Scripts;
+
+	while (script)
+	{
+		DLevelScript *next = script->next;
+		script->RunScript ();
+		script = next;
+	}
+}
+
+// FlashFader class - not sure where to put this so it goes here for now...
+class DFlashFader : public DThinker
+{
+	DECLARE_SERIAL (DFlashFader, DThinker)
+public:
+	DFlashFader (float r1, float g1, float b1, float a1,
+				 float r2, float g2, float b2, float a2,
+				 float time, AActor *who);
+	~DFlashFader ();
+	void RunThink () override;
+	virtual void DestroyedPointer(DObject *obj);
+	AActor *WhoFor() { return ForWho; }
+	void Cancel ();
+
+protected:
+	float Blends[2][4];
+	int TotalTics;
+	int StartTic;
+	AActor *ForWho;
+
+	void SetBlend (float time);
+	DFlashFader ();
+};
+
+IMPLEMENT_SERIAL(DFlashFader, DThinker)
+
+DFlashFader::DFlashFader ()
+{
+}
+
+void DFlashFader::DestroyedPointer(DObject *obj)
+{
+	if(obj == ForWho)
+		ForWho = NULL;
+}
+
+DFlashFader::DFlashFader (float r1, float g1, float b1, float a1,
+						  float r2, float g2, float b2, float a2,
+						  float time, AActor *who)
+	: TotalTics ((int)(time*TICRATE)), StartTic (level.time), ForWho (who)
+{
+	Blends[0][0]=r1; Blends[0][1]=g1; Blends[0][2]=b1; Blends[0][3]=a1;
+	Blends[1][0]=r2; Blends[1][1]=g2; Blends[1][2]=b2; Blends[1][3]=a2;
+}
+
+DFlashFader::~DFlashFader ()
+{
+	SetBlend (1.f);
+}
+
+void DFlashFader::Serialize (FArchive &arc)
+{
+	Super::Serialize (arc);
+
+	if (arc.IsStoring ())
+	{
+		arc << TotalTics << StartTic << ForWho;
+
+		for (int i = 1; i >= 0; --i)
+			for (int j = 3; j >= 0; --j)
+				arc << Blends[i][j];
+	}
+	else
+	{
+		arc >> TotalTics >> StartTic >> ForWho;
+
+		for (int i = 1; i >= 0; --i)
+			for (int j = 3; j >= 0; --j)
+				arc >> Blends[i][j];
+	}
+}
+
+void DFlashFader::RunThink ()
+{
+	if (ForWho == NULL || ForWho->player == NULL)
+	{
+		Destroy ();
+		return;
+	}
+	if (level.time >= StartTic+TotalTics)
+	{
+		SetBlend (1.f);
+		Destroy ();
+		return;
+	}
+	SetBlend ((float)(level.time - StartTic) / (float)TotalTics);
+}
+
+void DFlashFader::SetBlend (float time)
+{
+	if (ForWho == NULL || ForWho->player == NULL)
+		return;
+
+	player_t* player = ForWho->player;
+
+	float iT = 1.f - time;
+
+	player->blend_color = fargb_t(
+				Blends[0][3]*iT + Blends[1][3]*time,
+				Blends[0][0]*iT + Blends[1][0]*time,
+				Blends[0][1]*iT + Blends[1][1]*time,
+				Blends[0][2]*iT + Blends[1][2]*time);
+}
+
+void DFlashFader::Cancel ()
+{
+	TotalTics = level.time - StartTic;
+	Blends[1][3] = 0.f;
+}
+
+//---- Plane watchers ----//
+
+class DPlaneWatcher : public DThinker
+{
+	DECLARE_SERIAL (DPlaneWatcher, DThinker)
+public:
+	DPlaneWatcher (AActor *it, line_t *line, int lineSide, bool ceiling,
+		int tag, int height, int special,
+		int arg0, int arg1, int arg2, int arg3, int arg4);
+	void RunThink () override;
+	virtual void DestroyedPointer(DObject *obj);
+private:
+	sector_t *Sector;
+	fixed_t WatchD, LastD;
+	int Special, Arg0, Arg1, Arg2, Arg3, Arg4;
+	AActor *Activator;
+	line_t *Line;
+	int LineSide;
+	bool bCeiling;
+
+	DPlaneWatcher() {}
+};
+
+IMPLEMENT_SERIAL(DPlaneWatcher, DThinker)
+
+void DPlaneWatcher::DestroyedPointer(DObject *obj)
+{
+	if(obj == Activator)
+		Activator = NULL;
+}
+
+DPlaneWatcher::DPlaneWatcher (AActor *it, line_t *line, int lineSide, bool ceiling,
+	int tag, int height, int special,
+	int arg0, int arg1, int arg2, int arg3, int arg4)
+	: Special (special), Arg0 (arg0), Arg1 (arg1), Arg2 (arg2), Arg3 (arg3), Arg4 (arg4),
+	  Activator (it), Line (line), LineSide (lineSide), bCeiling (ceiling)
+{
+	int secnum;
+
+	secnum = P_FindSectorFromTag (tag, -1);
+	if (secnum >= 0)
+	{
+		Sector = &sectors[secnum];
+		fixed_t amount = height << FRACBITS;
+		if (bCeiling)
+		{
+			LastD = Sector->ceilingplane.d;
+			P_ChangeCeilingHeight(Sector, amount);
+			WatchD = Sector->ceilingplane.d;
+			P_ChangeCeilingHeight(Sector, -amount);
+		}
+		else
+		{
+			LastD = Sector->floorplane.d;
+			P_ChangeFloorHeight(Sector, amount);
+			WatchD = Sector->floorplane.d;
+			P_ChangeFloorHeight(Sector, -amount);
+		}
+	}
+	else
+	{
+		Sector = NULL;
+		WatchD = LastD = 0;
+	}
+}
+
+void DPlaneWatcher::Serialize (FArchive &arc)
+{
+	Super::Serialize (arc);
+
+	if (arc.IsStoring ())
+	{
+		arc << Special << Arg0 << Arg1 << Arg2 << Arg3 << Arg4
+			<< Sector << bCeiling << WatchD << LastD << Activator
+			<< Line << LineSide << bCeiling;
+	}
+	else
+	{
+		arc >> Special >> Arg0 >> Arg1 >> Arg2 >> Arg3 >> Arg4
+			>> Sector >> bCeiling >> WatchD >> LastD >> Activator
+			>> Line >> LineSide >> bCeiling;
+	}
+}
+
+void DPlaneWatcher::RunThink ()
+{
+	if (Sector == NULL)
+	{
+		Destroy ();
+		return;
+	}
+
+	fixed_t newd;
+
+	if (bCeiling)
+	{
+		newd = Sector->ceilingplane.d;
+	}
+	else
+	{
+		newd = Sector->floorplane.d;
+	}
+
+	if ((LastD < WatchD && newd >= WatchD) ||
+		(LastD > WatchD && newd <= WatchD))
+	{
+		TeleportSide = LineSide;
+		LineSpecials[Special] (Line, Activator, Arg0, Arg1, Arg2, Arg3, Arg4);
+
+		if (serverside)
+		{
+			SERVER_ONLY(SV_SendExecuteLineSpecial(Special, Line, Activator, Arg0, Arg1,
+			                                      Arg2, Arg3, Arg4));
+		}
+		Destroy ();
+	}
+}
+
+
+IMPLEMENT_SERIAL (DLevelScript, DObject)
+
+void *DLevelScript::operator new (size_t size)
+{
+	return Z_Malloc (sizeof(DLevelScript), PU_LEVACS, 0);
+}
+
+void DLevelScript::operator delete (void *block)
+{
+	Z_Free (block);
+}
+
+void DLevelScript::Serialize (FArchive &arc)
+{
+	uint32_t i;
+
+	Super::Serialize (arc);
+
+	if (arc.IsStoring ())
+	{
+		arc << next;
+		arc << prev;
+		arc << script;
+		arc << sp;
+		arc << state;
+		arc << statedata;
+
+		// [AM] We don't want player activators to be saved
+		if (arc.IsReset() && P_ThinkerIsPlayerType(activator))
+			arc << static_cast<AActor*>(nullptr);
+		else
+			arc << activator;
+
+		arc << activationline;
+		arc << lineSide;
+
+		for (i = 0; i < LOCAL_SIZE; i++)
+			arc << localvars[i];
+
+		i = level.behavior->PC2Ofs(pc);
+		arc << i;
+	}
+	else
+	{
+		arc >> next >> prev
+			>> script
+			>> sp
+			>> state
+			>> statedata
+			>> activator
+			>> activationline
+			>> lineSide;
+
+		for (i = 0; i < LOCAL_SIZE; i++)
+			arc >> localvars[i];
+
+		arc >> i;
+		pc = level.behavior->Ofs2PC (i);
+	}
+}
+
+DLevelScript::DLevelScript ()
+{
+	next = prev = NULL;
+	if (DACSThinker::ActiveThinker == NULL)
+		new DACSThinker;
+}
+
+
+void DLevelScript::Unlink ()
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+	if (controller->LastScript == this)
+		controller->LastScript = prev;
+	if (controller->Scripts == this)
+		controller->Scripts = next;
+	if (prev)
+		prev->next = next;
+	if (next)
+		next->prev = prev;
+}
+
+void DLevelScript::Link ()
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+	next = controller->Scripts;
+	if (controller->Scripts)
+		controller->Scripts->prev = this;
+	prev = NULL;
+	controller->Scripts = this;
+	if (controller->LastScript == NULL)
+		controller->LastScript = this;
+}
+
+void DLevelScript::PutLast ()
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+	if (controller->LastScript == this)
+		return;
+
+	Unlink ();
+	if (controller->Scripts == NULL)
+	{
+		Link ();
+	}
+	else
+	{
+		if (controller->LastScript)
+			controller->LastScript->next = this;
+		prev = controller->LastScript;
+		next = NULL;
+		controller->LastScript = this;
+	}
+}
+
+void DLevelScript::PutFirst ()
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+	if (controller->Scripts == this)
+		return;
+
+	Unlink ();
+	Link ();
+}
+
+int DLevelScript::Random (int min, int max)
+{
+	unsigned int num;
+
+	const int num1 = P_Random();
+	const int num2 = P_Random();
+	const int num3 = P_Random();
+	const int num4 = P_Random();
+
+	num = ((num1 << 24) | (num2 << 16) | (num3 << 8) | num4);
+	num %= (max - min + 1);
+	num += min;
+	return (int)num;
+}
+
+int DLevelScript::ThingCount (int type, int tid)
+{
+	AActor *mobj = NULL;
+	int count = 0;
+
+	if (static_cast<size_t>(type) >= SpawnableThings.size())
+	{
+		return 0;
+	}
+	else if (type > 0)
+	{
+		type = SpawnableThings[type];
+		if (type == 0)
+			return 0;
+	}
+
+	if (tid)
+	{
+		mobj = AActor::FindByTID (NULL, tid);
+		while (mobj)
+		{
+			if ((type == 0) || (mobj->type == type && mobj->health > 0))
+				count++;
+			mobj = mobj->FindByTID (tid);
+		}
+	}
+	else
+	{
+		AActor *actor;
+		TThinkerIterator<AActor> iterator;
+
+		while ( (actor = iterator.Next ()) )
+		{
+			if (type == 0)
+			{
+				count++;
+			}
+			else if (actor->type == type && actor->health > 0)
+			{
+				count++;
+			}
+		}
+	}
+	return count;
+}
+
+void DLevelScript::ChangeFlat (int tag, int name, bool floorOrCeiling)
+{
+	int secnum = -1;
+	const OLumpName flatname = level.behavior->LookupString (name);
+
+	if (flatname.empty())
+		return;
+
+	const int flat = R_FlatNumForName(flatname);
+
+	while ((secnum = P_FindSectorFromTag (tag, secnum)) >= 0)
+	{
+		if (floorOrCeiling == false)
+		{
+			sectors[secnum].floorpic = flat;
+		}
+		else
+		{
+			sectors[secnum].ceilingpic = flat;
+		}
+		sectors[secnum].SectorChanges |= SPC_FlatPic;
+	}
+
+	SERVER_ONLY(
+		const std::array args = {tag, name};
+		SV_ACSExecuteSpecial(floorOrCeiling ? PCD_CHANGECEILING : PCD_CHANGEFLOOR,
+		                     NULL, NULL, false, args);
+	)
+}
+
+size_t P_NumPlayersInGame();
+
+int DLevelScript::CountPlayers()
+{
+	return static_cast<int>(P_NumPlayersInGame());
+}
+
+void DLevelScript::ACS_SetLineTexture(const int* args, byte argCount)
+{
+	if (argCount < 4)
+		return;
+
+	SetLineTexture(args[0], args[1], args[2], args[3]);
+}
+
+void DLevelScript::ACS_ClearInventory(AActor* actor)
+{
+	ClearInventory(actor);
+}
+
+void DLevelScript::ACS_Print(byte pcd, AActor* activator, const char* print)
+{
+	if (print == NULL)
+		return;
+
+	bool local = activator != NULL && pcd != DLevelScript::PCD_ENDPRINTBOLD;
+
+	SERVER_ONLY(SV_ACSExecuteSpecial(pcd, activator, print, local));
+
+	if (clientside &&
+		(!local || (activator != NULL && activator->player && activator->player->mo == consoleplayer().camera)))
+	{
+		C_MidPrint(print);
+	}
+}
+
+void DLevelScript::ACS_ChangeMusic(byte pcd, const AActor* activator, const int* args, byte argCount)
+{
+	if (argCount < 2)
+		return;
+
+	ChangeMusic(pcd, activator, args[0], args[1]);
+}
+
+void DLevelScript::ACS_StartSound(byte pcd, const AActor* activator, const int* args, byte argCount)
+{
+	if (pcd == PCD_SECTORSOUND)
+	{
+		if (argCount < 5)
+			return;
+
+		int sectorid = args[0];
+		if (sectorid < numsectors)
+			StartSectorSound(pcd, &sectors[sectorid], args[1], args[2], args[3], args[4]);
+	}
+	else if (pcd == PCD_THINGSOUND || pcd == PCD_ACTIVATORSOUND)
+	{
+		if (argCount < 4)
+			return;
+
+		StartThingSound(pcd, activator, args[0], args[1], args[2], args[3]);
+	}
+	else
+	{
+		if (argCount < 4)
+			return;
+
+		StartSound(pcd, activator, args[0], args[1], args[2], args[3]);
+	}
+}
+
+void DLevelScript::ACS_SetLineBlocking(const int* args, byte argCount)
+{
+	if (argCount < 2)
+		return;
+
+	SetLineBlocking(args[0], args[1]);
+}
+
+void DLevelScript::ACS_SetLineMonsterBlocking(const int* args, byte argCount)
+{
+	if (argCount < 2)
+		return;
+
+	SetLineMonsterBlocking(args[0], args[1]);
+}
+
+void DLevelScript::ACS_SetLineSpecial(const int* args, byte argCount)
+{
+	if (argCount < 7)
+		return;
+
+	SetLineSpecial(args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+}
+
+void DLevelScript::ACS_SetThingSpecial(const int* args, byte argCount)
+{
+	if (argCount < 7)
+		return;
+
+	AActor* actor = P_FindThingById(args[0]);
+	if (actor)
+		SetThingSpecial(actor, args[1], args[2], args[3], args[4], args[5], args[6]);
+}
+
+void DLevelScript::ACS_FadeRange(AActor* activator, const int* args, byte argCount)
+{
+	if (argCount < 9)
+		return;
+
+	DoFadeRange(activator, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8]);
+}
+
+void DLevelScript::ACS_CancelFade(AActor* actor)
+{
+	CancelFade(actor);
+}
+
+void DLevelScript::ACS_ChangeFlat(byte pcd, const int* args, byte argCount)
+{
+	if (argCount < 2)
+		return;
+
+	ChangeFlat(args[0], args[1], pcd == PCD_CHANGECEILING);
+}
+
+void DLevelScript::ACS_SoundSequence(const int* args, byte argCount)
+{
+	if (argCount < 2)
+		return;
+
+	if (args[0] < numsectors)
+		StartSoundSequence(&sectors[args[0]], args[1]);
+}
+
+void DLevelScript::SetLineTexture(int lineid, int side, int position, int name)
+{
+	int texture, linenum = -1;
+	const OLumpName texname = level.behavior->LookupString(name);
+
+	if (texname.empty())
+		return;
+
+	SERVER_ONLY(
+		const std::array args = {lineid, side, position, name};
+		SV_ACSExecuteSpecial(PCD_SETLINETEXTURE, NULL, NULL, false, args);
+	)
+
+	side = (side) ? 1 : 0;
+
+	texture = R_TextureNumForName(texname);
+
+	while ((linenum = P_FindLineFromID (lineid, linenum)) >= 0)
+	{
+		side_t *currentSideDef;
+
+		if (lines[linenum].sidenum[side] == R_NOSIDE)
+			continue;
+
+		lines[linenum].SidedefChanged = true;
+		currentSideDef = sides + lines[linenum].sidenum[side];
+
+		switch (position)
+		{
+			case TEXTURE_TOP:
+				currentSideDef->toptexture = texture;
+				currentSideDef->SidedefChanges |= SDPC_TexTop;
+				break;
+			case TEXTURE_MIDDLE:
+				currentSideDef->midtexture = texture;
+				currentSideDef->SidedefChanges |= SDPC_TexMid;
+				break;
+			case TEXTURE_BOTTOM:
+				currentSideDef->bottomtexture = texture;
+				currentSideDef->SidedefChanges |= SDPC_TexBottom;
+				break;
+			default:
+				break;
+		}
+	}
+}
+
+void DLevelScript::SetLineBlocking(int lineid, int flags)
+{
+	int line = -1;
+
+	while ((line = P_FindLineFromID(lineid, line)) >= 0)
+	{
+		switch (flags)
+		{
+		case BLOCK_NOTHING:
+			lines[line].flags &= ~(ML_BLOCKING | ML_BLOCKEVERYTHING);
+			lines[line].PropertiesChanged = true;
+			break;
+		case BLOCK_CREATURES:
+		default:
+			lines[line].flags &= ~ML_BLOCKEVERYTHING;
+			lines[line].flags |= ML_BLOCKING;
+			lines[line].PropertiesChanged = true;
+			break;
+		case BLOCK_EVERYTHING:
+			lines[line].flags |= ML_BLOCKING | ML_BLOCKEVERYTHING;
+			lines[line].PropertiesChanged = true;
+			break;
+		}
+	}
+
+	SERVER_ONLY(
+		const std::array args  = {lineid, flags};
+		SV_ACSExecuteSpecial(PCD_SETLINEBLOCKING, NULL, NULL, false, args);
+	)
+}
+
+void DLevelScript::SetLineMonsterBlocking(int lineid, int toggle)
+{
+	int line = -1;
+
+	while ((line = P_FindLineFromID(lineid, line)) >= 0)
+	{
+		if (toggle)
+		{
+			lines[line].flags |= ML_BLOCKMONSTERS;
+		}
+		else
+		{
+			lines[line].flags &= ~ML_BLOCKMONSTERS;
+		}
+	}
+
+	SERVER_ONLY(
+		const std::array args = {lineid, toggle};
+		SV_ACSExecuteSpecial(PCD_SETLINEMONSTERBLOCKING, NULL, NULL, false, args);
+	)
+}
+
+void DLevelScript::SetLineSpecial(int lineid, int special, int arg1, int arg2, int arg3, int arg4, int arg5)
+{
+	int linenum = -1;
+
+	while ((linenum = P_FindLineFromID(lineid, linenum)) >= 0)
+	{
+		line_t *line = &lines[linenum];
+
+		line->special = special;
+		line->args[0] = arg1;
+		line->args[1] = arg2;
+		line->args[2] = arg3;
+		line->args[3] = arg4;
+		line->args[4] = arg5;
+	}
+
+	SERVER_ONLY(
+		const std::array args = {lineid, special, arg1, arg2, arg3, arg4, arg5};
+		SV_ACSExecuteSpecial(PCD_SETLINESPECIAL, NULL, NULL, false, args);
+	)
+}
+
+void DLevelScript::ActivateLineSpecial(byte special, line_t* line, AActor* activator,
+                                       int arg0, int arg1, int arg2, int arg3, int arg4)
+{
+	if (serverside)
+	{
+		LineSpecials[special](line, activator, arg0, arg1, arg2, arg3, arg4);
+		SERVER_ONLY(SV_SendExecuteLineSpecial(special, line, activator, arg0, arg1, arg2,
+		                                      arg3, arg4));
+	}
+}
+
+void DLevelScript::ChangeMusic(byte pcd, const AActor* activator, int index, int loop)
+{
+	bool local = (pcd == PCD_LOCALSETMUSIC || pcd == PCD_LOCALSETMUSICDIRECT);
+
+	if (clientside)
+	{
+		if (local && activator != consoleplayer().mo)
+			return;
+
+		const char* lookup = level.behavior->LookupString(index);
+		if (lookup != NULL)
+			S_ChangeMusic(lookup, loop);
+	}
+
+	SERVER_ONLY(
+		const std::array args = {index, loop};
+		SV_ACSExecuteSpecial(pcd, activator, NULL, local, args);
+	)
+}
+
+
+void DLevelScript::StartSound(byte pcd, const AActor* activator, int channel, int index, int volume, int attenuation)
+{
+	bool local = pcd == PCD_LOCALAMBIENTSOUND;
+
+	if (clientside)
+	{
+		if (local && consoleplayer().camera != activator)
+			return;
+
+		const char* lookup = level.behavior->LookupString(index);
+		if (lookup != NULL)
+			S_Sound(channel, lookup, (float)volume / 127.0F, attenuation);
+	}
+
+	SERVER_ONLY(
+		const std::array args = {channel, index, volume, attenuation};
+		SV_ACSExecuteSpecial(pcd, activator, NULL, local, args);
+	)
+}
+
+void DLevelScript::StartSectorSound(byte pcd, const sector_t* sector, int channel, int index, int volume, int attenuation)
+{
+	if (clientside)
+	{
+		const char* lookup = level.behavior->LookupString(index);
+		if (lookup != NULL)
+			S_Sound(sector->soundorg, channel, lookup, (float)volume / 127.0F, attenuation);
+	}
+
+	SERVER_ONLY(
+		int sectorNum = sector ? sector - sectors : 0;
+		const std::array args = {sectorNum, channel, index, volume, attenuation};
+		SV_ACSExecuteSpecial(pcd, NULL, NULL, false, args);
+	)
+}
+
+void DLevelScript::StartThingSound(byte pcd, const AActor* actor, int channel, int index, int volume, int attenuation)
+{
+	if (clientside)
+	{
+		const char* lookup = level.behavior->LookupString(index);
+		if (lookup != NULL)
+			S_Sound(actor, channel, lookup, (float)volume / 127.0F, attenuation);
+	}
+
+	SERVER_ONLY(
+		const std::array args = {channel, index, volume, attenuation};
+		SV_ACSExecuteSpecial(pcd, actor, NULL, false, args);
+	)
+}
+
+void DLevelScript::SetThingSpecial(AActor* actor, int special, int arg1, int arg2, int arg3, int arg4, int arg5)
+{
+	actor->special = special;
+	actor->args[0] = arg1;
+	actor->args[1] = arg2;
+	actor->args[2] = arg3;
+	actor->args[3] = arg4;
+	actor->args[4] = arg5;
+
+	SERVER_ONLY(
+		const std::array args = {static_cast<int>(actor->netid), special, arg1, arg2, arg3, arg4, arg5};
+		SV_ACSExecuteSpecial(PCD_SETTHINGSPECIAL, actor, NULL, false, args);
+	)
+}
+
+void DLevelScript::CancelFade(AActor* actor)
+{
+	if (clientside)
+	{
+		TThinkerIterator<DFlashFader> iterator;
+		DFlashFader *fader;
+
+		while ((fader = iterator.Next()))
+		{
+			if (actor == NULL || fader->WhoFor() == actor)
+				fader->Cancel();
+		}
+	}
+
+	SERVER_ONLY(SV_ACSExecuteSpecial(PCD_CANCELFADE, actor, NULL, true));
+}
+
+void DLevelScript::StartSoundSequence(sector_t* sec, int index)
+{
+	if (clientside)
+	{
+		const char* lookup = level.behavior->LookupString(index);
+		if (lookup != NULL)
+			SN_StartSequence(sec, lookup);
+	}
+
+	SERVER_ONLY(
+		const std::array args = {static_cast<int>(sec - sectors), index};
+		SV_ACSExecuteSpecial(PCD_SOUNDSEQUENCE, NULL, NULL, false, args);
+	)
+}
+
+EXTERN_CVAR(sv_nomonsters)
+
+namespace
+{
+
+std::optional<std::pair<byte, uint32_t>> GetFountainSpawnInfo(const char* mobjstr)
+{
+	const auto make_return = [](const uint32_t fountaintype) {
+		return std::pair<byte, uint32_t>({ fountaintype >> FX_FOUNTAINSHIFT, fountaintype });
+	};
+	switch (OUtil::CONST_HASH_NO_CASE(mobjstr)) {
+		case OUtil::CONST_HASH_NO_CASE("YellowParticleFountain"):
+			return make_return(FX_YELLOWFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("RedParticleFountain"):
+			return make_return(FX_REDFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("BlueParticleFountain"):
+			return make_return(FX_BLUEFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("GreenParticleFountain"):
+			return make_return(FX_GREENFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("PurpleParticleFountain"):
+			return make_return(FX_PURPLEFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("BlackParticleFountain"):
+			return make_return(FX_BLACKFOUNTAIN);
+		case OUtil::CONST_HASH_NO_CASE("WhiteParticleFountain"):
+			return make_return(FX_WHITEFOUNTAIN);
+		default:
+			return std::nullopt;
+	}
+}
+
+}
+
+// TODO: deduplicate these and the similar functions in P_Interaction
+int DLevelScript::DoSpawn(int type, fixed_t x, fixed_t y, fixed_t z, int tid, angle_t angle, bool force)
+{
+	const char* typestr = level.behavior->LookupString(type);
+	if (typestr == nullptr)
+		return 0;
+
+	mobjtype_t info = P_INameToMobj(typestr);
+	std::optional<std::pair<byte, uint32_t>> fountain_info;
+	if (info == MT_NULL)
+	{
+		fountain_info = GetFountainSpawnInfo(typestr);
+		if (fountain_info)
+			info = MT_FOUNTAIN;
+	}
+
+	int spawncount = 0;
+
+	if (info != MT_NULL && !((mobjinfo[info].flags & MF_COUNTKILL) && sv_nomonsters))
+	{
+		auto* actor = new AActor (x, y, z, info);
+
+		if (actor != nullptr)
+		{
+			if (force || P_TestMobjLocation(actor))
+			{
+				if (fountain_info)
+				{
+					actor->args[0] = fountain_info->first;
+					actor->effects = fountain_info->second;
+				}
+				actor->angle = angle;
+				actor->tid = tid;
+				actor->AddToHash();
+				actor->flags |= MF_DROPPED;  // Don't respawn
+				spawncount++;
+			}
+			else
+			{
+				actor->Destroy();
+				actor = nullptr;
+			}
+		}
+	}
+	else if (info == MT_NULL)
+	{
+		DPrintFmt("ACS: LOGIC ERROR - Could not spawn thing {}\n", typestr);
+	}
+
+	return spawncount;
+}
+
+int DLevelScript::DoSpawnSpot(int type, int spot, int tid, std::optional<angle_t> angle, bool force)
+{
+	FActorIterator iterator(spot);
+	AActor* aspot;
+	int spawned = 0;
+
+	while ((aspot = iterator.Next())) {
+		spawned += DoSpawn(type, aspot->x, aspot->y, aspot->z, tid, angle.value_or(aspot->angle), force);
+	}
+	return spawned;
+}
+
+void DLevelScript::DoSpawnProjectile(int tid, int type, angle_t angle, fixed_t speed, fixed_t vspeed, bool gravity, int newtid)
+{
+	const char* typestr = level.behavior->LookupString(type);
+	if (typestr == nullptr)
+		return;
+
+	auto info = P_INameToMobj(typestr);
+	std::optional<std::pair<byte, uint32_t>> fountain_info;
+	if (info == MT_NULL)
+	{
+		fountain_info = GetFountainSpawnInfo(typestr);
+		if (fountain_info)
+			info = MT_FOUNTAIN;
+		else
+			return;
+	}
+
+	if ((mobjinfo[info].flags & MF_COUNTKILL) && sv_nomonsters)
+		return;
+
+	AActor* spot = nullptr;
+	AActor* mobj = nullptr;
+	while ( (spot = AActor::FindByTID (spot, tid)) )
+	{
+		if (spot->type != MT_MAPSPOT && spot->type != MT_MAPSPOTGRAVITY)
+			continue;
+
+		mobj = new AActor(spot->x, spot->y, spot->z, info);
+
+		if (mobj)
+		{
+			if (mobj->info->seesound)
+				S_Sound (mobj, CHAN_VOICE, mobj->info->seesound, 1, ATTN_NORM);
+			if (gravity)
+			{
+				mobj->flags &= ~MF_NOGRAVITY;
+				if (!(mobj->flags & MF_COUNTKILL))
+					mobj->flags2 |= MF2_LOGRAV;
+			}
+			else
+				mobj->flags |= MF_NOGRAVITY;
+			if (fountain_info)
+			{
+				mobj->args[0] = fountain_info->first;
+				mobj->effects = fountain_info->second;
+			}
+			mobj->target = spot->ptr();
+			mobj->angle = angle;
+			mobj->momx = FixedMul(speed, finecosine[angle>>ANGLETOFINESHIFT]);
+			mobj->momy = FixedMul(speed, finesine[angle>>ANGLETOFINESHIFT]);
+			mobj->momz = vspeed;
+			mobj->flags |= MF_DROPPED;
+			mobj->tid = newtid;
+			if (mobj->flags & MF_MISSILE)
+				P_CheckMissileSpawn(mobj);
+			else if (!P_TestMobjLocation(mobj))
+				mobj->Destroy ();
+		}
+	}
+}
+
+void DLevelScript::DoFadeTo(AActor* who, int r, int g, int b, int a, fixed_t time)
+{
+    DPrintFmt("DoFadeRange now... \n");
+	DoFadeRange(who, 0, 0, 0, -1, r, g, b, a, time);
+}
+
+static void DoActualFadeRange(player_s* viewer, float ftime, bool fadingFrom,
+                              float fr1, float fg1, float fb1, float fa1,
+                              float fr2, float fg2, float fb2, float fa2)
+{
+	if (ftime <= 0.f)
+	{
+		viewer->blend_color = fargb_t(fa2, fr2, fg2, fb2);
+	}
+	else
+	{
+		if (!fadingFrom)
+		{
+			if (viewer->blend_color.geta() == 0)
+			{
+				fr1 = fr2;
+				fg1 = fg2;
+				fb1 = fb2;
+				fa1 = 0.f;
+			}
+			else
+			{
+				fr1 = viewer->blend_color.geta() / 255.0f;
+				fr1 = viewer->blend_color.getr() / 255.0f;
+				fg1 = viewer->blend_color.getg() / 255.0f;
+				fb1 = viewer->blend_color.getb() / 255.0f;
+			}
+		}
+		new DFlashFader(fr1, fg1, fb1, fa1, fr2, fg2, fb2, fa2, ftime, viewer->mo);
+	}
+}
+
+void DLevelScript::DoFadeRange(AActor* who, int r1, int g1, int b1, int a1,
+	int r2, int g2, int b2, int a2, fixed_t time)
+{
+	if (clientside && who->player != NULL)
+	{
+		float ftime = (float)time / 65536.f;
+		bool fadingFrom = a1 >= 0;
+		float fr1 = 0.f, fg1 = 0.f, fb1 = 0.f, fa1 = 0.f;
+		float fr2, fg2, fb2, fa2;
+
+		fr2 = (float)r2 / 255.f;
+		fg2 = (float)g2 / 255.f;
+		fb2 = (float)b2 / 255.f;
+		fa2 = (float)a2 / 65536.f;
+
+		if (fadingFrom)
+		{
+			fr1 = (float)r1 / 255.f;
+			fg1 = (float)g1 / 255.f;
+			fb1 = (float)b1 / 255.f;
+			fa1 = (float)a1 / 65536.f;
+		}
+
+		DoActualFadeRange(who->player, ftime, fadingFrom, fr1, fg1, fb1, fa1, fr2, fg2, fb2, fa2);
+	}
+
+	SERVER_ONLY(
+		const std::array args = {r1, g1, b1, a1, r2, g2, b2, a2, time};
+		SV_ACSExecuteSpecial(PCD_FADERANGE, who, NULL, true, args);
+	)
+}
+
+inline int getbyte (int *&pc)
+{
+	int res = *(byte *)pc;
+	pc = (int *)((byte *)pc+1);
+	return res;
+}
+
+inline int getshort (int *&pc)
+{
+	int res = LESHORT(*(uint16_t *)pc);
+	pc = (int *)((byte *)pc+2);
+	return res;
+}
+
+void DLevelScript::RunScript ()
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+    TeleportSide = lineSide;
+    int *locals = localvars;
+    ScriptFunction *activeFunction = NULL;
+
+	switch (state)
+	{
+	case SCRIPT_Delayed:
+		// Decrement the delay counter and enter state running
+		// if it hits 0
+		if (--statedata == 0)
+			state = SCRIPT_Running;
+		break;
+
+	case SCRIPT_TagWait:
+		// Wait for tagged sector(s) to go inactive, then enter
+		// state running
+	{
+		int secnum = -1;
+
+		while ((secnum = P_FindSectorFromTag (statedata, secnum)) >= 0)
+			if (sectors[secnum].floordata || sectors[secnum].ceilingdata)
+				return;
+
+		// If we got here, none of the tagged sectors were busy
+		state = SCRIPT_Running;
+	}
+	break;
+
+	case SCRIPT_PolyWait:
+		// Wait for polyobj(s) to stop moving, then enter state running
+		if (!PO_Busy (statedata))
+		{
+			state = SCRIPT_Running;
+		}
+		break;
+
+	case SCRIPT_ScriptWaitPre:
+		// Wait for a script to start running, then enter state scriptwait
+		if (controller->RunningScripts[statedata])
+			state = SCRIPT_ScriptWait;
+		break;
+
+	case SCRIPT_ScriptWait:
+		// Wait for a script to stop running, then enter state running
+		if (controller->RunningScripts[statedata])
+			return;
+
+		state = SCRIPT_Running;
+		PutFirst ();
+		break;
+
+	default:
+		break;
+	}
+
+	int *pc = this->pc;
+	int sp = this->sp;
+	const ACSFormat fmt = level.behavior->GetFormat();
+	int runaway = 0;	// used to prevent infinite loops
+	int pcd;
+	std::string work;
+	const char *lookup;
+//	int optstart = -1;
+	int temp;
+
+	while (state == SCRIPT_Running)
+	{
+		if (++runaway > 500000)
+		{
+			DPrintFmt("Runaway script {} terminated\n", script);
+			state = SCRIPT_PleaseRemove;
+			break;
+		}
+
+		if (fmt == ACS_LittleEnhanced)
+		{
+			pcd = getbyte(pc);
+			if (pcd >= 240)
+			{
+				pcd = 240 + ((pcd - 240) << 8) + getbyte(pc);
+			}
+		}
+		else
+		{
+			pcd = NEXTWORD;
+		}
+
+		switch (pcd)
+		{
+		default:
+			// TODO: validate bytecode upon loading and transform unknown into PCD_TERMINATE
+			// and replace the default case with a call to OUtil::unreachable()
+			// this should give a decent improvement to performance
+			DPrintFmt("Unknown P-Code {} in script {}\n", pcd, script);
+			PrintFmt(PRINT_WARNING, "Encountered a problem while executing ACS script #{}. Terminating script...", script);
+			[[fallthrough]];
+		case PCD_TERMINATE:
+			state = SCRIPT_PleaseRemove;
+			break;
+
+		case PCD_NOP:
+			break;
+
+		case PCD_SUSPEND:
+			state = SCRIPT_Suspended;
+			break;
+
+		case PCD_PUSHNUMBER:
+			PushToStack(NEXTWORD);
+			break;
+
+		case PCD_PUSHBYTE:
+			PushToStack(*(byte*)pc);
+			pc = (int*)((byte*)pc + 1);
+			break;
+
+		case PCD_PUSH2BYTES:
+			Stack[sp] = ((byte*)pc)[0];
+			Stack[sp + 1] = ((byte*)pc)[1];
+			sp += 2;
+			pc = (int*)((byte*)pc + 2);
+			break;
+
+		case PCD_PUSH3BYTES:
+			Stack[sp] = ((byte*)pc)[0];
+			Stack[sp + 1] = ((byte*)pc)[1];
+			Stack[sp + 2] = ((byte*)pc)[2];
+			sp += 3;
+			pc = (int*)((byte*)pc + 3);
+			break;
+
+		case PCD_PUSH4BYTES:
+			Stack[sp] = ((byte*)pc)[0];
+			Stack[sp + 1] = ((byte*)pc)[1];
+			Stack[sp + 2] = ((byte*)pc)[2];
+			Stack[sp + 3] = ((byte*)pc)[3];
+			sp += 4;
+			pc = (int*)((byte*)pc + 4);
+			break;
+
+		case PCD_PUSH5BYTES:
+			Stack[sp] = ((byte*)pc)[0];
+			Stack[sp + 1] = ((byte*)pc)[1];
+			Stack[sp + 2] = ((byte*)pc)[2];
+			Stack[sp + 3] = ((byte*)pc)[3];
+			Stack[sp + 4] = ((byte*)pc)[4];
+			sp += 5;
+			pc = (int*)((byte*)pc + 5);
+			break;
+
+		case PCD_PUSHBYTES:
+			temp = *(byte*)pc;
+			pc = (int*)((byte*)pc + temp + 1);
+			for (temp = -temp; temp; temp++)
+			{
+				PushToStack(*((byte*)pc + temp));
+			}
+			break;
+
+		case PCD_DUP:
+			Stack[sp] = Stack[sp - 1];
+			sp++;
+			break;
+
+		case PCD_SWAP:
+			std::swap(Stack[sp - 2], Stack[sp - 1]);
+			break;
+
+		case PCD_LSPEC1:
+			ActivateLineSpecial(NEXTBYTE, activationline, activator,
+						STACK(1), 0, 0, 0, 0);
+			sp -= 1;
+			break;
+
+		case PCD_LSPEC2:
+			ActivateLineSpecial(NEXTBYTE, activationline, activator,
+						STACK(2), STACK(1), 0, 0, 0);
+			sp -= 2;
+			break;
+
+		case PCD_LSPEC3:
+			ActivateLineSpecial(NEXTBYTE, activationline, activator,
+						STACK(3), STACK(2), STACK(1), 0, 0);
+			sp -= 3;
+			break;
+
+		case PCD_LSPEC4:
+			ActivateLineSpecial(NEXTBYTE, activationline, activator,
+						STACK(4), STACK(3), STACK(2),
+						STACK(1), 0);
+			sp -= 4;
+			break;
+
+		case PCD_LSPEC5:
+			ActivateLineSpecial(NEXTBYTE, activationline, activator,
+						STACK(5), STACK(4), STACK(3),
+						STACK(2), STACK(1));
+			sp -= 5;
+			break;
+
+		case PCD_LSPEC1DIRECT:
+			temp = NEXTBYTE;
+			ActivateLineSpecial(temp, activationline, activator,
+						pc[0], 0, 0, 0, 0);
+			pc += 1;
+			break;
+
+		case PCD_LSPEC2DIRECT:
+			temp = NEXTBYTE;
+			ActivateLineSpecial(temp, activationline, activator,
+						pc[0], pc[1], 0, 0, 0);
+			pc += 2;
+			break;
+
+		case PCD_LSPEC3DIRECT:
+			temp = NEXTBYTE;
+			ActivateLineSpecial(temp, activationline, activator,
+						pc[0], pc[1], pc[2], 0, 0);
+			pc += 3;
+			break;
+
+		case PCD_LSPEC4DIRECT:
+			temp = NEXTBYTE;
+			ActivateLineSpecial(temp, activationline, activator,
+						pc[0], pc[1], pc[2], pc[3], 0);
+			pc += 4;
+			break;
+
+		case PCD_LSPEC5DIRECT:
+			temp = NEXTBYTE;
+			ActivateLineSpecial(temp, activationline, activator,
+						pc[0], pc[1], pc[2], pc[3], pc[4]);
+			pc += 5;
+			break;
+
+		case PCD_LSPEC1DIRECTB:
+			ActivateLineSpecial(((byte *)pc)[0], activationline, activator,
+				((byte *)pc)[1], 0, 0, 0, 0);
+			pc = (int *)((byte *)pc + 2);
+			break;
+
+		case PCD_LSPEC2DIRECTB:
+			ActivateLineSpecial(((byte *)pc)[0], activationline, activator,
+				((byte *)pc)[1], ((byte *)pc)[2], 0, 0, 0);
+			pc = (int *)((byte *)pc + 3);
+			break;
+
+		case PCD_LSPEC3DIRECTB:
+			ActivateLineSpecial(((byte *)pc)[0], activationline, activator,
+				((byte *)pc)[1], ((byte *)pc)[2], ((byte *)pc)[3], 0, 0);
+			pc = (int *)((byte *)pc + 4);
+			break;
+
+		case PCD_LSPEC4DIRECTB:
+			ActivateLineSpecial(((byte *)pc)[0], activationline, activator,
+				((byte *)pc)[1], ((byte *)pc)[2], ((byte *)pc)[3],
+				((byte *)pc)[4], 0);
+			pc = (int *)((byte *)pc + 5);
+			break;
+
+		case PCD_LSPEC5DIRECTB:
+			ActivateLineSpecial(((byte *)pc)[0], activationline, activator,
+				((byte *)pc)[1], ((byte *)pc)[2], ((byte *)pc)[3],
+				((byte *)pc)[4], ((byte *)pc)[5]);
+			pc = (int *)((byte *)pc + 6);
+			break;
+
+		case PCD_CALL:
+		case PCD_CALLDISCARD:
+			{
+				int funcnum;
+				int i;
+				ScriptFunction* func;
+
+				funcnum = NEXTBYTE;
+				func = level.behavior->GetFunction(funcnum);
+				if (func == NULL)
+				{
+					PrintFmt(PRINT_HIGH, "Function {} in script {} out of range\n", funcnum,
+					       script);
+					state = SCRIPT_PleaseRemove;
+					break;
+				}
+				if (sp + func->LocalCount + 32 > STACK_SIZE)
+				{ // 32 is the margin for the function's working space
+					PrintFmt(PRINT_HIGH, "Out of stack space in script {}\n", script);
+					state = SCRIPT_PleaseRemove;
+					break;
+				}
+				// The function's first argument is also its first local variable.
+				locals = &Stack[sp - func->ArgCount];
+				// Make space on the stack for any other variables the function uses.
+				for (i = 0; i < func->LocalCount; ++i)
+				{
+					Stack[sp + i] = 0;
+				}
+				sp += i;
+				((CallReturn*)&Stack[sp])->ReturnAddress = level.behavior->PC2Ofs(pc);
+				((CallReturn*)&Stack[sp])->ReturnFunction = activeFunction;
+				((CallReturn*)&Stack[sp])->bDiscardResult = (pcd == PCD_CALLDISCARD);
+				sp += sizeof(CallReturn) / sizeof(int);
+				pc = level.behavior->Ofs2PC(func->Address);
+				activeFunction = func;
+			}
+			break;
+
+		case PCD_RETURNVOID:
+		case PCD_RETURNVAL:
+			{
+				int value;
+				CallReturn* retState;
+
+				if (pcd == PCD_RETURNVAL)
+				{
+					value = Stack[--sp];
+				}
+				else
+				{
+					value = 0;
+				}
+				sp -= sizeof(CallReturn) / sizeof(int);
+				retState = (CallReturn*)&Stack[sp];
+				pc = level.behavior->Ofs2PC(retState->ReturnAddress);
+				sp -= activeFunction->ArgCount + activeFunction->LocalCount;
+				activeFunction = retState->ReturnFunction;
+				if (activeFunction == NULL)
+				{
+					locals = localvars;
+				}
+				else
+				{
+					locals =
+					    &Stack[sp - activeFunction->ArgCount - activeFunction->LocalCount];
+				}
+				if (!retState->bDiscardResult)
+				{
+					Stack[sp++] = value;
+				}
+			}
+			break;
+
+		case PCD_ADD:
+			STACK(2) = STACK(2) + STACK(1);
+			sp--;
+			break;
+
+		case PCD_SUBTRACT:
+			STACK(2) = STACK(2) - STACK(1);
+			sp--;
+			break;
+
+		case PCD_MULTIPLY:
+			STACK(2) = STACK(2) * STACK(1);
+			sp--;
+			break;
+
+		case PCD_DIVIDE:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				STACK(2) = STACK(2) / STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_MODULUS:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				STACK(2) = STACK(2) % STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_EQ:
+			STACK(2) = (STACK(2) == STACK(1));
+			sp--;
+			break;
+
+		case PCD_NE:
+			STACK(2) = (STACK(2) != STACK(1));
+			sp--;
+			break;
+
+		case PCD_LT:
+			STACK(2) = (STACK(2) < STACK(1));
+			sp--;
+			break;
+
+		case PCD_GT:
+			STACK(2) = (STACK(2) > STACK(1));
+			sp--;
+			break;
+
+		case PCD_LE:
+			STACK(2) = (STACK(2) <= STACK(1));
+			sp--;
+			break;
+
+		case PCD_GE:
+			STACK(2) = (STACK(2) >= STACK(1));
+			sp--;
+			break;
+
+		case PCD_ASSIGNSCRIPTVAR:
+			locals[NEXTBYTE] = STACK(1);
+			sp--;
+			break;
+
+		case PCD_ASSIGNMAPVAR:
+			level.vars[NEXTBYTE] = STACK(1);
+			sp--;
+			break;
+
+		case PCD_ASSIGNWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] = STACK(1);
+			sp--;
+			break;
+
+		case PCD_ASSIGNGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] = STACK(1);
+			sp--;
+			break;
+
+		case PCD_ASSIGNMAPARRAY:
+			level.behavior->SetArrayVal(level.vars[NEXTBYTE], STACK(2), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_ASSIGNWORLDARRAY:
+			ACS_WorldArrays[NEXTBYTE][STACK(2)] = STACK(1);
+			sp -= 2;
+			break;
+
+		case PCD_ASSIGNGLOBALARRAY:
+			ACS_GlobalArrays[NEXTBYTE][STACK(2)] = STACK(1);
+			sp -= 2;
+			break;
+
+		case PCD_PUSHSCRIPTVAR:
+			PushToStack(locals[NEXTBYTE]);
+			break;
+
+		case PCD_PUSHMAPVAR:
+			PushToStack(level.vars[NEXTBYTE]);
+			break;
+
+		case PCD_PUSHWORLDVAR:
+			PushToStack(ACS_WorldVars[NEXTBYTE]);
+			break;
+
+		case PCD_PUSHGLOBALVAR:
+			PushToStack(ACS_GlobalVars[NEXTBYTE]);
+			break;
+
+		case PCD_PUSHMAPARRAY:
+			STACK(1) = level.behavior->GetArrayVal(level.vars[NEXTBYTE], STACK(1));
+			break;
+
+		case PCD_PUSHWORLDARRAY:
+			STACK(1) = ACS_WorldArrays[NEXTBYTE][STACK(1)];
+			break;
+
+		case PCD_PUSHGLOBALARRAY:
+			STACK(1) = ACS_GlobalArrays[NEXTBYTE][STACK(1)];
+			break;
+
+		case PCD_ADDSCRIPTVAR:
+			locals[NEXTBYTE] += STACK(1);
+			sp--;
+			break;
+
+		case PCD_ADDMAPVAR:
+			level.vars[NEXTBYTE] += STACK(1);
+			sp--;
+			break;
+
+		case PCD_ADDWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] += STACK(1);
+			sp--;
+			break;
+
+		case PCD_ADDGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] += STACK(1);
+			sp--;
+			break;
+
+		case PCD_ADDMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) + STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ADDWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] += STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ADDGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] += STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_SUBSCRIPTVAR:
+			locals[NEXTBYTE] -= STACK(1);
+			sp--;
+			break;
+
+		case PCD_SUBMAPVAR:
+			level.vars[NEXTBYTE] -= STACK(1);
+			sp--;
+			break;
+
+		case PCD_SUBWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] -= STACK(1);
+			sp--;
+			break;
+
+		case PCD_SUBGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] -= STACK(1);
+			sp--;
+			break;
+
+		case PCD_SUBMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) - STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_SUBWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] -= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_SUBGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] -= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MULSCRIPTVAR:
+			locals[NEXTBYTE] *= STACK(1);
+			sp--;
+			break;
+
+		case PCD_MULMAPVAR:
+			level.vars[NEXTBYTE] *= STACK(1);
+			sp--;
+			break;
+
+		case PCD_MULWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] *= STACK(1);
+			sp--;
+			break;
+
+		case PCD_MULGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] *= STACK(1);
+			sp--;
+			break;
+
+		case PCD_MULMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) * STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MULWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] *= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MULGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] *= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_DIVSCRIPTVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				locals[NEXTBYTE] /= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_DIVMAPVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				level.vars[NEXTBYTE] /= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_DIVWORLDVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				ACS_WorldVars[NEXTBYTE] /= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_DIVGLOBALVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				ACS_GlobalVars[NEXTBYTE] /= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_DIVMAPARRAY:
+			{
+				if (STACK(1) == 0)
+				{
+					state = SCRIPT_DivideBy0;
+				}
+				else
+				{
+					int a = level.vars[NEXTBYTE];
+					int i = STACK(2);
+					level.behavior->SetArrayVal(
+						a, i, level.behavior->GetArrayVal(a, i) / STACK(1));
+					sp -= 2;
+				}
+			}
+			break;
+
+		case PCD_DIVWORLDARRAY:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] /= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_DIVGLOBALARRAY:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_DivideBy0;
+			}
+			else
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] /= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MODSCRIPTVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				locals[NEXTBYTE] %= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_MODMAPVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				level.vars[NEXTBYTE] %= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_MODWORLDVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				ACS_WorldVars[NEXTBYTE] %= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_MODGLOBALVAR:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				ACS_GlobalVars[NEXTBYTE] %= STACK(1);
+				sp--;
+			}
+			break;
+
+		case PCD_MODMAPARRAY:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+											level.behavior->GetArrayVal(a, i) % STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MODWORLDARRAY:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] %= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_MODGLOBALARRAY:
+			if (STACK(1) == 0)
+			{
+				state = SCRIPT_ModulusBy0;
+			}
+			else
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] %= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_INCSCRIPTVAR:
+			++locals[NEXTBYTE];
+			break;
+
+		case PCD_INCMAPVAR:
+			++level.vars[NEXTBYTE];
+			break;
+
+		case PCD_INCWORLDVAR:
+			++ACS_WorldVars[NEXTBYTE];
+			break;
+
+		case PCD_INCGLOBALVAR:
+			++ACS_GlobalVars[NEXTBYTE];
+			break;
+
+		case PCD_INCMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal (a, i,
+					level.behavior->GetArrayVal (a, i) + 1);
+				sp--;
+			}
+			break;
+
+		case PCD_INCWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(1)] += 1;
+				sp--;
+			}
+			break;
+
+		case PCD_INCGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(1)] += 1;
+				sp--;
+			}
+			break;
+
+		case PCD_DECSCRIPTVAR:
+			--locals[NEXTBYTE];
+			break;
+
+		case PCD_DECMAPVAR:
+			--level.vars[NEXTBYTE];
+			break;
+
+		case PCD_DECWORLDVAR:
+			--ACS_WorldVars[NEXTBYTE];
+			break;
+
+		case PCD_DECGLOBALVAR:
+			--ACS_GlobalVars[NEXTBYTE];
+			break;
+
+		case PCD_DECMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal (a, i,
+					level.behavior->GetArrayVal (a, i) - 1);
+				sp--;
+			}
+			break;
+
+		case PCD_DECWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(1)] -= 1;
+				sp--;
+			}
+			break;
+
+		case PCD_DECGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(1)] -= 1;
+				sp--;
+			}
+			break;
+
+		case PCD_GOTO:
+			pc = level.behavior->Ofs2PC (*pc);
+			break;
+
+		case PCD_IFGOTO:
+			if (STACK(1))
+				pc = level.behavior->Ofs2PC (*pc);
+			else
+				pc++;
+			sp--;
+			break;
+
+		case PCD_DROP:
+			sp--;
+			break;
+
+		case PCD_DELAY:
+			state = SCRIPT_Delayed;
+			statedata = STACK(1);
+			sp--;
+			break;
+
+		case PCD_DELAYDIRECT:
+			state = SCRIPT_Delayed;
+			statedata = NEXTWORD;
+			break;
+
+		case PCD_DELAYDIRECTB:
+			state = SCRIPT_Delayed;
+			statedata = *(byte *)pc;
+			pc = (int *)((byte *)pc + 1);
+			break;
+
+		case PCD_RANDOM:
+			STACK(2) = Random (STACK(2), STACK(1));
+			sp--;
+			break;
+
+		case PCD_RANDOMDIRECT:
+			PushToStack (Random (pc[0], pc[1]));
+			pc += 2;
+			break;
+
+		case PCD_RANDOMDIRECTB:
+			PushToStack (Random (((byte *)pc)[0], ((byte *)pc)[1]));
+			pc = (int *)((byte *)pc + 2);
+			break;
+
+		case PCD_THINGCOUNT:
+			STACK(2) = ThingCount (STACK(2), STACK(1));
+			sp--;
+			break;
+
+		case PCD_THINGCOUNTDIRECT:
+			PushToStack (ThingCount (pc[0], pc[1]));
+			pc += 2;
+			break;
+
+		case PCD_TAGWAIT:
+			state = SCRIPT_TagWait;
+			statedata = STACK(1);
+			sp--;
+			break;
+
+		case PCD_TAGWAITDIRECT:
+			state = SCRIPT_TagWait;
+			statedata = NEXTWORD;
+			break;
+
+		case PCD_POLYWAIT:
+			state = SCRIPT_PolyWait;
+			statedata = STACK(1);
+			sp--;
+			break;
+
+		case PCD_POLYWAITDIRECT:
+			state = SCRIPT_PolyWait;
+			statedata = NEXTWORD;
+			break;
+
+		case PCD_CHANGEFLOOR:
+			ChangeFlat (STACK(2), STACK(1), false);
+			sp -= 2;
+			break;
+
+		case PCD_CHANGEFLOORDIRECT:
+			ChangeFlat (pc[0], pc[1], false);
+			pc += 2;
+			break;
+
+		case PCD_CHANGECEILING:
+			ChangeFlat (STACK(2), STACK(1), true);
+			sp -= 2;
+			break;
+
+		case PCD_CHANGECEILINGDIRECT:
+			ChangeFlat (pc[0], pc[1], true);
+			pc += 2;
+			break;
+
+		case PCD_RESTART:
+			pc = level.behavior->FindScript (script);
+			break;
+
+		case PCD_ANDLOGICAL:
+			STACK(2) = (STACK(2) && STACK(1));
+			sp--;
+			break;
+
+		case PCD_ORLOGICAL:
+			STACK(2) = (STACK(2) || STACK(1));
+			sp--;
+			break;
+
+		case PCD_ANDBITWISE:
+			STACK(2) = (STACK(2) & STACK(1));
+			sp--;
+			break;
+
+		case PCD_ORBITWISE:
+			STACK(2) = (STACK(2) | STACK(1));
+			sp--;
+			break;
+
+		case PCD_EORBITWISE:
+			STACK(2) = (STACK(2) ^ STACK(1));
+			sp--;
+			break;
+
+		case PCD_NEGATELOGICAL:
+			STACK(1) = !STACK(1);
+			break;
+
+		case PCD_LSHIFT:
+			STACK(2) = (STACK(2) << STACK(1));
+			sp--;
+			break;
+
+		case PCD_RSHIFT:
+			STACK(2) = (STACK(2) >> STACK(1));
+			sp--;
+			break;
+
+		case PCD_UNARYMINUS:
+			STACK(1) = -STACK(1);
+			break;
+
+		case PCD_IFNOTGOTO:
+			if (!STACK(1))
+				pc = level.behavior->Ofs2PC (*pc);
+			else
+				pc++;
+			sp--;
+			break;
+
+		case PCD_LINESIDE:
+			PushToStack (lineSide);
+			break;
+
+		case PCD_SCRIPTWAIT:
+			statedata = STACK(1);
+			if (controller->RunningScripts[statedata])
+				state = SCRIPT_ScriptWait;
+			else
+				state = SCRIPT_ScriptWaitPre;
+			sp--;
+			PutLast ();
+			break;
+
+		case PCD_SCRIPTWAITDIRECT:
+			state = SCRIPT_ScriptWait;
+			statedata = NEXTWORD;
+			PutLast ();
+			break;
+
+		case PCD_CLEARLINESPECIAL:
+			if (activationline)
+				activationline->special = 0;
+			break;
+
+		case PCD_CASEGOTO:
+			if (STACK(1) == NEXTWORD)
+			{
+				pc = level.behavior->Ofs2PC (*pc);
+				sp--;
+			}
+			else
+			{
+				pc++;
+			}
+			break;
+
+		case PCD_BEGINPRINT:
+			work.clear();
+			break;
+
+		case PCD_PRINTSTRING:
+		case PCD_PRINTLOCALIZED:
+			lookup = (pcd == PCD_PRINTSTRING ?
+				level.behavior->LookupString (STACK(1)) :
+				level.behavior->LocalizeString (STACK(1)));
+			if (lookup != nullptr)
+			{
+				work += lookup;
+			}
+			--sp;
+			break;
+
+		case PCD_PRINTNUMBER:
+			work += fmt::format("{:d}", STACK(1));
+			--sp;
+			break;
+
+		case PCD_PRINTCHARACTER:
+			work += static_cast<char>(STACK(1));
+			--sp;
+			break;
+
+		case PCD_PRINTFIXED:
+			work += fmt::format("{:g}", FIXED2FLOAT(STACK(1)));
+			--sp;
+			break;
+
+		case PCD_PRINTBINARY:
+			work += fmt::format("{:B}", STACK(1));
+			--sp;
+			break;
+
+		case PCD_PRINTHEX:
+			work += fmt::format("{:X}", STACK(1));
+			--sp;
+			break;
+
+		// [BC] Print activator's name
+		// [RH] Fancied up a bit
+		case PCD_PRINTNAME:
+			{
+				player_t *player = nullptr;
+
+				if (STACK(1) < 0)
+				{
+					switch (STACK(1))
+					{
+						case PRINTNAME_LEVELNAME:
+							work += level.level_name;
+							break;
+						case PRINTNAME_LEVEL:
+							work += level.mapname;
+							break;
+						case PRINTNAME_NEXTLEVEL:
+							work += level.nextmap;
+							break;
+						case PRINTNAME_NEXTSECRET:
+							work += level.secretmap;
+							break;
+						case PRINTNAME_SKILL:
+							work += G_GetCurrentSkill().name;
+							break;
+						default:
+							work += ' ';
+					}
+				}
+				else if (STACK(1) == 0 || (unsigned)STACK(1) > MAXPLAYERS)
+				{
+					if (activator)
+					{
+						player = activator->player;
+					}
+				}
+				else if (idplayer(STACK(1) - 1).ingame())
+				{
+					player = &idplayer(STACK(1) - 1);
+				}
+				else
+				{
+					work += fmt::format("Player {:d}\n", STACK(1));
+					sp--;
+					break;
+				}
+				if (player)
+				{
+					work += activator->player->userinfo.netname;
+				}
+				else if (activator)
+				{
+					work += activator->info->getDisplayName();
+				}
+				else
+				{
+					work += ' ';
+				}
+				sp--;
+			}
+			break;
+
+		case PCD_ENDPRINT:
+		case PCD_ENDPRINTBOLD:
+		//case PCD_MOREHUDMESSAGE:
+			strbin (work.data());
+			if (pcd != PCD_MOREHUDMESSAGE)
+			{
+				ACS_Print(pcd, activator, work.c_str());
+			}
+			else
+			{
+//				optstart = -1;
+			}
+			break;
+
+		/*case PCD_OPTHUDMESSAGE:
+			optstart = sp;
+			break;
+
+		case PCD_ENDHUDMESSAGE:
+		case PCD_ENDHUDMESSAGEBOLD:
+			if (optstart == -1)
+			{
+				optstart = sp;
+			}
+			if (pcd == PCD_ENDHUDMESSAGEBOLD || activator == NULL ||
+				(activator->player->mo == consoleplayer().camera))
+			{
+				int type = Stack[optstart-6];
+				int id = Stack[optstart-5];
+				EColorRange color = CLAMPCOLOR(Stack[optstart-4]);
+				float x = FIXED2FLOAT(Stack[optstart-3]);
+				float y = FIXED2FLOAT(Stack[optstart-2]);
+				float holdTime = FIXED2FLOAT(Stack[optstart-1]);
+				DHUDMessage *msg;
+
+				switch (type)
+				{
+				default:	// normal
+					msg = new DHUDMessage (work, x, y, color, holdTime);
+					break;
+				case 1:		// fade out
+					{
+						float fadeTime = (optstart < sp) ?
+							FIXED2FLOAT(Stack[optstart]) : 0.5f;
+						msg = new DHUDMessageFadeOut (work, x, y, color, holdTime, fadeTime);
+					}
+					break;
+				case 2:		// type on, then fade out
+					{
+						float typeTime = (optstart < sp) ?
+							FIXED2FLOAT(Stack[optstart]) : 0.05f;
+						float fadeTime = (optstart < sp-1) ?
+							FIXED2FLOAT(Stack[optstart+1]) : 0.5f;
+						msg = new DHUDMessageTypeOnFadeOut (work, x, y, color, typeTime, holdTime, fadeTime);
+					}
+					break;
+				}
+				StatusBar->AttachMessage (msg, id ? 0xff000000|id : 0);
+			}
+			sp = optstart-6;
+			break;
+        */
+		/*case PCD_SETFONT:
+			DoSetFont (STACK(1));
+			sp--;
+			break;
+
+		case PCD_SETFONTDIRECT:
+			DoSetFont (pc[0]);
+			pc++;
+			break;
+        */
+		case PCD_PLAYERCOUNT:
+			PushToStack (CountPlayers ());
+			break;
+
+		case PCD_GAMETYPE:
+			if (sv_gametype == 3)
+				PushToStack (GAME_NET_CTF);
+			else if (sv_gametype == 2)
+				PushToStack (GAME_NET_TEAMDEATHMATCH);
+			else if (sv_gametype == 1)
+				PushToStack (GAME_NET_DEATHMATCH);
+			else if (multiplayer)
+				PushToStack (GAME_NET_COOPERATIVE);
+			else
+				PushToStack (GAME_SINGLE_PLAYER);
+			break;
+
+		case PCD_GAMESKILL:
+			PushToStack (G_GetCurrentSkill().ACS_return);
+			break;
+
+// [BC] Start ST PCD's
+		case PCD_PLAYERHEALTH:
+			if (activator)
+				PushToStack (activator->health);
+			else
+				PushToStack (0);
+			break;
+
+		case PCD_PLAYERARMORPOINTS:
+			if (activator && activator->player)
+				PushToStack (activator->player->armorpoints);
+			else
+				PushToStack (0);
+			break;
+
+		case PCD_PLAYERFRAGS:
+			if (activator && activator->player)
+				PushToStack (activator->player->fragcount);
+			else
+				PushToStack (0);
+			break;
+
+		case PCD_MUSICCHANGE:
+			ChangeMusic(pcd, activator, STACK(2), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_SINGLEPLAYER:
+			PushToStack (!multiplayer);
+			break;
+// [BC] End ST PCD's
+
+		case PCD_TIMER:
+			PushToStack (level.time);
+			break;
+
+		case PCD_SECTORSOUND:
+			if (activationline)
+				StartSectorSound(pcd, activationline->frontsector, CHAN_BODY, STACK(2), STACK(1), ATTN_NORM);
+			else
+				StartSound(pcd, NULL, CHAN_BODY, STACK(2), STACK(1), ATTN_NORM);
+			sp -= 2;
+			break;
+
+		case PCD_AMBIENTSOUND:
+			StartSound(pcd, activator, CHAN_AUTO, STACK(2), STACK(1), ATTN_NONE);
+			break;
+
+		case PCD_LOCALAMBIENTSOUND:
+			StartSound(pcd, activator, CHAN_AUTO, STACK(2), STACK(1), ATTN_NONE);
+			sp -= 2;
+			break;
+
+		case PCD_ACTIVATORSOUND:
+			StartThingSound(pcd, activator, CHAN_AUTO, STACK(2), STACK(1), ATTN_NORM);
+			sp -= 2;
+			break;
+
+		case PCD_SOUNDSEQUENCE:
+			if (activationline)
+				StartSoundSequence(activationline->frontsector, STACK(1));
+			sp--;
+			break;
+
+		case PCD_SETLINETEXTURE:
+			SetLineTexture (STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 4;
+			break;
+
+		case PCD_SETLINEBLOCKING:
+			SetLineBlocking(STACK(2), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_SETLINEMONSTERBLOCKING:
+			SetLineMonsterBlocking(STACK(2), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_SETLINESPECIAL:
+			SetLineSpecial(STACK(7), STACK(6), STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 7;
+			break;
+
+		case PCD_SETTHINGSPECIAL:
+		{
+			FActorIterator iterator (STACK(7));
+			AActor *actor;
+
+			while ( (actor = iterator.Next ()) )
+				SetThingSpecial(actor, STACK(6), STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 7;
+		}
+			break;
+
+		case PCD_THINGSOUND:
+		{
+			FActorIterator iterator(STACK(3));
+			AActor *spot;
+			while ((spot = iterator.Next()))
+				StartThingSound(pcd, spot, CHAN_BODY, STACK(2), STACK(1), ATTN_NORM);
+			sp -= 3;
+		}
+			break;
+
+		case PCD_FIXEDMUL:
+			STACK(2) = FixedMul (STACK(2), STACK(1));
+			sp--;
+			break;
+
+		case PCD_FIXEDDIV:
+			STACK(2) = FixedDiv (STACK(2), STACK(1));
+			sp--;
+			break;
+
+		case PCD_SETGRAVITY:
+			level.gravity = (float)STACK(1) / 65536.f;
+			sp--;
+			break;
+
+		case PCD_SETGRAVITYDIRECT:
+			level.gravity = (float)pc[0] / 65536.f;
+			pc++;
+			break;
+
+		case PCD_SETAIRCONTROL:
+			level.aircontrol = STACK(1);
+			sp--;
+			G_AirControlChanged ();
+			break;
+
+		case PCD_SETAIRCONTROLDIRECT:
+			level.aircontrol = pc[0];
+			pc++;
+			G_AirControlChanged ();
+			break;
+
+		case PCD_SPAWN:
+			STACK(6) = DoSpawn (STACK(6), STACK(5), STACK(4), STACK(3), STACK(2), BYTEANGLE(STACK(1)), false);
+			sp -= 5;
+			break;
+
+		case PCD_SPAWNDIRECT:
+			PushToStack (DoSpawn (pc[0], pc[1], pc[2], pc[3], pc[4], BYTEANGLE(pc[5]), false));
+			pc += 6;
+			break;
+
+		case PCD_SPAWNSPOT:
+			STACK(4) = DoSpawnSpot (STACK(4), STACK(3), STACK(2), BYTEANGLE(STACK(1)), false);
+			sp -= 3;
+			break;
+
+		case PCD_SPAWNSPOTDIRECT:
+			PushToStack (DoSpawnSpot (pc[0], pc[1], pc[2], BYTEANGLE(pc[3]), false));
+			pc += 4;
+			break;
+
+		case PCD_SPAWNSPOTFACING:
+			STACK(3) = DoSpawnSpot(STACK(3), STACK(2), STACK(1), std::nullopt, false);
+			sp -= 2;
+			break;
+
+		case PCD_SPAWNPROJECTILE:
+			DoSpawnProjectile(STACK(7), STACK(6), BYTEANGLE(STACK(5)), SPEED(STACK(4)), SPEED(STACK(3)), STACK(2), STACK(1));
+			sp -= 7;
+			break;
+
+		case PCD_THING_PROJECTILE2:
+			P_Thing_Projectile(STACK(7), STACK(6), BYTEANGLE(STACK(5)), SPEED(STACK(4)), SPEED(STACK(3)), STACK(2), STACK(1));
+			sp -= 7;
+			break;
+
+		case PCD_CLEARINVENTORY:
+			ClearInventory (activator);
+			break;
+
+		case PCD_GIVEINVENTORY:
+			GiveInventory (activator, level.behavior->LookupString (STACK(2)), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_GIVEINVENTORYDIRECT:
+			GiveInventory (activator, level.behavior->LookupString (pc[0]), pc[1]);
+			pc += 2;
+			break;
+
+		case PCD_TAKEINVENTORY:
+			TakeInventory (activator, level.behavior->LookupString (STACK(2)), STACK(1));
+			sp -= 2;
+			break;
+
+		case PCD_TAKEINVENTORYDIRECT:
+			TakeInventory (activator, level.behavior->LookupString (pc[0]), pc[1]);
+			pc += 2;
+			break;
+
+		case PCD_CHECKINVENTORY:
+			STACK(1) = CheckInventory (activator, level.behavior->LookupString (STACK(1)));
+			break;
+
+		case PCD_CHECKINVENTORYDIRECT:
+			PushToStack (CheckInventory (activator, level.behavior->LookupString (pc[0])));
+			pc += 1;
+			break;
+
+		case PCD_SETMUSIC:
+			ChangeMusic(pcd, NULL, STACK(3), STACK(2));
+			sp -= 3;
+			break;
+
+		case PCD_SETMUSICDIRECT:
+			ChangeMusic(pcd, NULL, pc[0], pc[1]);
+			pc += 3;
+			break;
+
+		case PCD_LOCALSETMUSIC:
+			ChangeMusic(pcd, activator, STACK(3), STACK(2));
+			sp -= 3;
+			break;
+
+		case PCD_LOCALSETMUSICDIRECT:
+			ChangeMusic(pcd, activator, pc[0], pc[1]);
+			pc += 3;
+			break;
+
+		case PCD_FADETO:
+			DoFadeTo (activator, STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 5;
+			break;
+
+		case PCD_FADERANGE:
+			DoFadeRange (activator, STACK(9), STACK(8), STACK(7), STACK(6),
+						 STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 9;
+			break;
+
+		case PCD_CANCELFADE:
+			CancelFade(activator);
+			break;
+
+		/*case PCD_PLAYMOVIE:
+			STACK(1) = I_PlayMovie (level.behavior->LookupString (STACK(1)));
+			break;
+        */
+		case PCD_GETACTORX:
+		case PCD_GETACTORY:
+		case PCD_GETACTORZ:
+			{
+			    AActor *actor = SingleActorFromTID(STACK(1), activator);
+
+				if (actor == NULL)
+				{
+					STACK(1) = 0;
+				}
+				else
+				{
+					STACK(1) = (&actor->x)[pcd - PCD_GETACTORX];
+				}
+			}
+			break;
+
+		case PCD_GETACTORANGLE:
+			{
+				AActor *actor = SingleActorFromTID (STACK(1), activator);
+
+				if (actor == NULL)
+				{
+					STACK(1) = 0;
+				}
+				else
+				{
+					STACK(1) = actor->angle >> FRACBITS;
+				}
+			}
+			break;
+
+		case PCD_SETACTORANGLE:
+			{
+				const int tid = STACK(2);
+				const angle_t angle = STACK(1) << FRACBITS;
+
+				if (tid == 0)
+				{
+					if (activator != NULL)
+						activator->angle = angle;
+				}
+				else
+				{
+					FActorIterator iterator(tid);
+					AActor* actor;
+					while ((actor = iterator.Next()) != NULL)
+						actor->angle = angle;
+				}
+
+				sp -= 2;
+			}
+			break;
+
+		case PCD_SETFLOORTRIGGER:
+			new DPlaneWatcher (activator, activationline, lineSide, false, STACK(8),
+				STACK(7), STACK(6), STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 8;
+			break;
+
+		case PCD_SETCEILINGTRIGGER:
+			new DPlaneWatcher (activator, activationline, lineSide, true, STACK(8),
+				STACK(7), STACK(6), STACK(5), STACK(4), STACK(3), STACK(2), STACK(1));
+			sp -= 8;
+			break;
+
+		/*case PCD_STARTTRANSLATION:
+			{
+				int i = STACK(1);
+				sp--;
+				if (i >= 1 && i <= MAX_ACS_TRANSLATIONS)
+				{
+					translation = &translationtables[TRANSLATION_LevelScripted][i*256-256];
+					for (i = 0; i < 256; ++i)
+					{
+						translation[i] = i;
+					}
+				}
+			}
+			break;
+
+		case PCD_TRANSLATIONRANGE1:
+			{ // translation using palette shifting
+				int start = STACK(4);
+				int end = STACK(3);
+				int pal1 = STACK(2);
+				int pal2 = STACK(1);
+				fixed_t palcol, palstep;
+				sp -= 4;
+
+				if (translation == NULL)
+				{
+					break;
+				}
+				if (start > end)
+				{
+					swap (start, end);
+					swap (pal1, pal2);
+				}
+				else if (start == end)
+				{
+					translation[start] = pal1;
+					break;
+				}
+				palcol = pal1 << FRACBITS;
+				palstep = ((pal2 << FRACBITS) - palcol) / (end - start);
+				for (int i = start; i <= end; palcol += palstep, ++i)
+				{
+					translation[i] = palcol >> FRACBITS;
+				}
+			}
+			break;
+
+		case PCD_TRANSLATIONRANGE2:
+			{ // translation using RGB values
+			  // (would HSV be a good idea too?)
+				int start = STACK(8);
+				int end = STACK(7);
+				fixed_t r1 = STACK(6) << FRACBITS;
+				fixed_t g1 = STACK(5) << FRACBITS;
+				fixed_t b1 = STACK(4) << FRACBITS;
+				fixed_t r2 = STACK(3) << FRACBITS;
+				fixed_t g2 = STACK(2) << FRACBITS;
+				fixed_t b2 = STACK(1) << FRACBITS;
+				fixed_t r, g, b;
+				fixed_t rs, gs, bs;
+				sp -= 8;
+
+				if (translation == NULL)
+				{
+					break;
+				}
+				if (start > end)
+				{
+					swap (start, end);
+					r = r2;
+					g = g2;
+					b = b2;
+					rs = r1 - r2;
+					gs = g1 - g2;
+					bs = b1 - b2;
+				}
+				else
+				{
+					r = r1;
+					g = g1;
+					b = b1;
+					rs = r2 - r1;
+					gs = g2 - g1;
+					bs = b2 - b1;
+				}
+				if (start == end)
+				{
+					translation[start] = ColorMatcher.Pick
+						(r >> FRACBITS, g >> FRACBITS, b >> FRACBITS);
+					break;
+				}
+				rs /= (end - start);
+				gs /= (end - start);
+				bs /= (end - start);
+				for (int i = start; i <= end; ++i)
+				{
+					translation[i] = ColorMatcher.Pick
+						(r >> FRACBITS, g >> FRACBITS, b >> FRACBITS);
+					r += rs;
+					g += gs;
+					b += bs;
+				}
+			}
+			break;
+
+		case PCD_ENDTRANSLATION:
+			// This might be useful for hardware rendering, but
+			// for software it is superfluous.
+			translation = NULL;
+			break;
+        */
+
+		case PCD_SIN:
+			STACK(1) = finesine[(STACK(1)<<16)>>ANGLETOFINESHIFT];
+			break;
+
+		case PCD_COS:
+			STACK(1) = finecosine[(STACK(1)<<16)>>ANGLETOFINESHIFT];
+			break;
+
+		case PCD_VECTORANGLE:
+			STACK(2) = R_PointToAngle2 (0, 0, STACK(2), STACK(1)) >> 16;
+			sp--;
+			break;
+
+		case PCD_PLAYERNUMBER:
+			if (activator == NULL || activator->player == NULL)
+				PushToStack(-1);
+			else
+				PushToStack(activator->player->GetPlayerNumber());
+			break;
+
+		case PCD_ACTIVATORTID:
+			if (activator == NULL)
+				PushToStack(0);
+			else
+				PushToStack(activator->tid);
+			break;
+
+		case PCD_GETCVAR:
+			{
+				cvar_t *prev;
+				const auto var = cvar_t::FindCVar(level.behavior->LookupString(STACK(1)), &prev);
+				STACK(1) = var == nullptr ? 0 : var->asInt();
+			}
+			break;
+
+		case PCD_GETLEVELINFO:
+			switch (STACK(1))
+			{
+			case LEVELINFO_PAR_TIME:
+				STACK(1) = level.partime;
+				break;
+			case LEVELINFO_SUCK_TIME:
+				STACK(1) = 0;	//level.sucktime; -- ToDo?
+				break;
+			case LEVELINFO_CLUSTERNUM:
+				STACK(1) = level.cluster;
+				break;
+			case LEVELINFO_LEVELNUM:
+				STACK(1) = level.levelnum;
+				break;
+			case LEVELINFO_TOTAL_SECRETS:
+				STACK(1) = level.total_secrets;
+				break;
+			case LEVELINFO_FOUND_SECRETS:
+				STACK(1) = level.found_secrets;
+				break;
+			case LEVELINFO_TOTAL_ITEMS:
+				STACK(1) = level.total_items;
+				break;
+			case LEVELINFO_FOUND_ITEMS:
+				STACK(1) = level.found_items;
+				break;
+			case LEVELINFO_TOTAL_MONSTERS:
+				STACK(1) = level.total_monsters;
+				break;
+			case LEVELINFO_KILLED_MONSTERS:
+				STACK(1) = level.killed_monsters;
+				break;
+			default:
+				STACK(1) = 0;
+				break;
+			}
+			break;
+
+		/*case PCD_CHECKWEAPON:
+			if (activator == NULL || activator->player == NULL)
+			{ // Non-players do not have ready weapons
+				STACK(1) = 0;
+			}
+			else
+			{
+				STACK(1) = 0 == strcmp (level.behavior->LookupString (STACK(1)),
+					wpnlev1info[activator->player->readyweapon]->type->Name+1);
+			}
+			break;
+
+		case PCD_SETWEAPON:
+			if (activator == NULL || activator->player == NULL)
+			{
+				STACK(1) = 0;
+			}
+			else
+			{
+				int i;
+
+				for (i = 0; i < NUMWEAPONS; ++i)
+				{
+					if (0 == strcmp (level.behavior->LookupString (STACK(1)),
+						wpnlev1info[i]->type->Name+1))
+					{
+						break;
+					}
+				}
+				if (i >= NUMWEAPONS || !activator->player->weaponowned[i])
+				{
+					STACK(1) = 0;
+				}
+				else
+				{
+					STACK(1) = 1;
+					if (activator->player->readyweapon != i)
+					{
+						activator->player->pendingweapon = (weapontype_t)i;
+					}
+				}
+			}
+			break;
+		*/
+		case PCD_ANDSCRIPTVAR:
+			locals[NEXTBYTE] &= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ANDMAPVAR:
+			level.vars[NEXTBYTE] &= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ANDWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] &= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ANDGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] &= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ANDMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) & STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ANDWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] &= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ANDGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] &= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_EORSCRIPTVAR:
+			locals[NEXTBYTE] ^= STACK(1);
+			sp--;
+			break;
+
+		case PCD_EORMAPVAR:
+			level.vars[NEXTBYTE] ^= STACK(1);
+			sp--;
+			break;
+
+		case PCD_EORWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] ^= STACK(1);
+			sp--;
+			break;
+
+		case PCD_EORGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] ^= STACK(1);
+			sp--;
+			break;
+
+		case PCD_EORMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) ^ STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_EORWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] ^= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_EORGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] ^= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ORSCRIPTVAR:
+			locals[NEXTBYTE] |= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ORMAPVAR:
+			level.vars[NEXTBYTE] |= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ORWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] |= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ORGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] |= STACK(1);
+			sp--;
+			break;
+
+		case PCD_ORMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) | STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ORWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] |= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_ORGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] |= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_LSSCRIPTVAR:
+			locals[NEXTBYTE] <<= STACK(1);
+			sp--;
+			break;
+
+		case PCD_LSMAPVAR:
+			level.vars[NEXTBYTE] <<= STACK(1);
+			sp--;
+			break;
+
+		case PCD_LSWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] <<= STACK(1);
+			sp--;
+			break;
+
+		case PCD_LSGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] <<= STACK(1);
+			sp--;
+			break;
+
+		case PCD_LSMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) << STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_LSWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] <<= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_LSGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] <<= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_RSSCRIPTVAR:
+			locals[NEXTBYTE] >>= STACK(1);
+			sp--;
+			break;
+
+		case PCD_RSMAPVAR:
+			level.vars[NEXTBYTE] >>= STACK(1);
+			sp--;
+			break;
+
+		case PCD_RSWORLDVAR:
+			ACS_WorldVars[NEXTBYTE] >>= STACK(1);
+			sp--;
+			break;
+
+		case PCD_RSGLOBALVAR:
+			ACS_GlobalVars[NEXTBYTE] >>= STACK(1);
+			sp--;
+			break;
+
+		case PCD_RSMAPARRAY:
+			{
+				int a = level.vars[NEXTBYTE];
+				int i = STACK(2);
+				level.behavior->SetArrayVal(a, i,
+				                            level.behavior->GetArrayVal(a, i) >> STACK(1));
+				sp -= 2;
+			}
+			break;
+
+		case PCD_RSWORLDARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_WorldArrays[a][STACK(2)] >>= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_RSGLOBALARRAY:
+			{
+				int a = NEXTBYTE;
+				ACS_GlobalArrays[a][STACK(2)] >>= STACK(1);
+				sp -= 2;
+			}
+			break;
+
+		case PCD_STRLEN:
+			{
+				const char* str = level.behavior->LookupString(STACK(1));
+				STACK(1) = str ? static_cast<int32_t>(strlen(str)) : 0;
+			}
+			break;
+
+		case PCD_CALLFUNC:
+			{
+				const int nargs = NEXTBYTE;
+				const int function = NEXTSHORT;
+				const nonstd::span<const int> args(&STACK(nargs), nargs);
+				const auto result = CallFunction(script, function, args);
+				sp -= (nargs - 1);
+				STACK(1) = result.value_or(0);
+				if (!result)
+					PrintFmt(
+						"Call ACS internal function {} with {} args. At least {} args required\n",
+						function, nargs, result.error().num_required_args
+					);
+			}
+			break;
+		}
+	}
+
+	this->pc = pc;
+	this->sp = sp;
+
+	if (state == SCRIPT_DivideBy0)
+	{
+		DPrintFmt("Divide by zero in script {}\n", script);
+		state = SCRIPT_PleaseRemove;
+	}
+	else if (state == SCRIPT_ModulusBy0)
+	{
+		DPrintFmt("Modulus by zero in script {}\n", script);
+		state = SCRIPT_PleaseRemove;
+	}
+
+	if (state == SCRIPT_PleaseRemove)
+	{
+		Unlink ();
+		if (!controller)
+			return;
+
+		if (controller->RunningScripts[script] == this)
+			controller->RunningScripts[script] = NULL;
+		this->Destroy ();
+	}
+}
+
+fixed_t P_BulletSlope(AActor* mo);
+
+auto DLevelScript::CallFunction(const int scriptnum, const int func, const nonstd::span<const int> args)
+	-> nonstd::expected<int, callfunc_args_error_t>
+{
+	#define CHECK_MIN_ARGS(minArgs) \
+		do { \
+			if (args.size() < (minArgs)) { \
+				return nonstd::make_unexpected<callfunc_args_error_t>({(minArgs)}); \
+			} \
+		} while(0)
+
+	switch (func) {
+		case CF_SETACTIVATOR:
+			CHECK_MIN_ARGS(1);
+			activator = AActor::FindByTID(nullptr, args[0]);
+			return activator != nullptr;
+
+		case CF_SETACTIVATORTOTARGET:
+			CHECK_MIN_ARGS(1);
+			{
+				auto actor = SingleActorFromTID(STACK(1), activator);
+				if (actor == nullptr)
+					return 0;
+
+				auto player = actor->player;
+				if (player != nullptr && player->mo != nullptr && player->playerstate == PST_LIVE)
+				{
+					P_BulletSlope(actor->player->mo);
+					actor = linetarget;
+				}
+				else
+				{
+					actor = actor->target;
+				}
+
+				if (actor != nullptr)
+				{
+					activator = actor;
+					return 1;
+				}
+
+				return 0;
+			}
+
+		case CF_SETSKYSCROLLSPEED:
+			CHECK_MIN_ARGS(2);
+			CLIENT_ONLY(R_SetSkyScrollSpeed(args[0], args[1]));
+			return 1;
+
+		case CF_SPAWNSPOTFORCED:
+			CHECK_MIN_ARGS(4);
+			return DoSpawnSpot(args[0], args[1], args[2], BYTEANGLE(args[3]), true);
+
+		case CF_SPAWNSPOTFACINGFORCED:
+			CHECK_MIN_ARGS(3);
+			return DoSpawnSpot(args[0], args[1], args[2], std::nullopt, true);
+
+		case CF_SPAWNFORCED:
+			CHECK_MIN_ARGS(4);
+			return DoSpawn(args[0], args[1], args[2], args[3], args.size() > 4 ? args[4] : 0, args.size() > 5 ? BYTEANGLE(args[5]) : 0, true);
+
+		case CF_SQRT:
+			CHECK_MIN_ARGS(1);
+			return static_cast<int>(std::floor(std::sqrt(static_cast<double>(args[0]))));
+
+		case CF_FIXEDSQRT:
+			CHECK_MIN_ARGS(1);
+			return DOUBLE2FIXED(std::sqrt(FIXED2DOUBLE(args[0])));
+
+		case CF_VECTORLENGTH:
+			CHECK_MIN_ARGS(2);
+			return M_LengthVec2Fixed(v2fixed_t(args[0], args[1]));
+
+		case CF_STRCMP:
+		case CF_STRICMP:
+			CHECK_MIN_ARGS(2);
+			{
+				// same string
+				if (args[0] == args[1])
+					return 0;
+
+				const char* str1 = level.behavior->LookupString(args[0]);
+				const char* str2 = level.behavior->LookupString(args[1]);
+
+				if (args.size() > 2)
+					return (func == CF_STRCMP) ? strncmp(str1, str2, args[2]) : strnicmp(str1, str2, args[2]);
+
+				return (func == CF_STRCMP) ? strcmp(str1, str2) : stricmp(str1, str2);
+			}
+
+		case CF_SETSECTORDAMAGE:
+			CHECK_MIN_ARGS(2);
+			{
+				int secnum = -1;
+				while ((secnum = P_FindSectorFromTag (args[0], secnum)) >= 0)
+				{
+					auto& sec = sectors[secnum];
+					sec.damageamount = args[1];
+					sec.mod = args.size() > 2 ? StrToMOD(level.behavior->LookupString(args[2])) : MOD_UNKNOWN;
+					sec.damageinterval = args.size() > 3 ? std::clamp(args[3], 1, limits::MAXINT) : 32;
+					sec.leakrate = args.size() > 4 ? args[4] : 0;
+				}
+				return 0;
+			}
+
+		// TODO: maybe make functions in m_fixed.h?
+		case CF_FLOOR:
+			CHECK_MIN_ARGS(1);
+			return args[0] & ~0xffff;
+
+		case CF_CEIL:
+			CHECK_MIN_ARGS(1);
+			return (args[0] & ~0xffff) + INT2FIXED(1);
+
+		case CF_ROUND:
+			CHECK_MIN_ARGS(1);
+			return (args[0] + DOUBLE2FIXED(0.5)) & ~0xFFFF;
+
+		default:
+			// TODO: similar to the first big switch in RunScript, validate these ahead of time
+			// and replace this case with OUtil::unreachable()
+			// map unrecognized funcs to
+			DPrintFmt("Tried to call unsupported ACS internal function {} in script {}\n", func, scriptnum);
+			return 0;
+	}
+
+	#undef CHECK_MIN_ARGS
+}
+
+namespace {
+
+bool P_GetScriptGoing (AActor *who, line_t *where, int num, int *code,
+	int lineSide, int arg0, int arg1, int arg2, int always, bool delay)
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+
+	if (controller && !always && controller->RunningScripts[num])
+	{
+		if (controller->RunningScripts[num]->GetState () == DLevelScript::SCRIPT_Suspended)
+		{
+			controller->RunningScripts[num]->SetState (DLevelScript::SCRIPT_Running);
+			return true;
+		}
+		return false;
+	}
+
+	new DLevelScript (who, where, num, code, lineSide, arg0, arg1, arg2, always, delay);
+
+	return true;
+}
+
+} // namespace
+
+DLevelScript::DLevelScript (AActor *who, line_t *where, int num, int *code, int lineside,
+							int arg0, int arg1, int arg2, int always, bool delay)
+{
+	if (DACSThinker::ActiveThinker == NULL)
+		new DACSThinker;
+
+	script = num;
+	sp = 0;
+	localvars[0] = arg0;
+	localvars[1] = arg1;
+	localvars[2] = arg2;
+	memset (localvars+3, 0, sizeof(localvars)-3*sizeof(int));
+	pc = code;
+	activator = who;
+	activationline = where;
+	lineSide = lineside;
+	// [EB] 29 June 2026 - Silence duplicated branch warning by re-adding the original branch
+	// but adding demoplayback condition, in case we add hexen demo support
+	if (delay && demoplayback) {
+		// From Hexen: Give the world some time to set itself up before
+		// running open scripts.
+		state = SCRIPT_Delayed;
+		statedata = TICRATE;
+	} else {
+		state = SCRIPT_Running;
+	}
+
+	if (!always)
+		DACSThinker::ActiveThinker->RunningScripts[num] = this;
+
+	Link ();
+
+	DPrintFmt("Script {} started.\n", num);
+}
+
+static void SetScriptState (int script, DLevelScript::EScriptState state)
+{
+	DACSThinker *controller = DACSThinker::ActiveThinker;
+	if (!controller)
+		return;
+
+	if (controller->RunningScripts[script])
+		controller->RunningScripts[script]->SetState (state);
+}
+
+void P_DoDeferedScripts()
+{
+	acsdefered_t *def;
+	int *scriptdata;
+	AActor *gomo = NULL;
+
+	// Handle defered scripts in this step, too
+	def = level.info->defered;
+	while (def)
+	{
+		acsdefered_t *next = def->next;
+		switch (def->type)
+		{
+		case acsdefered_t::defexecute:
+		case acsdefered_t::defexealways:
+			scriptdata = level.behavior->FindScript (def->script);
+			if (scriptdata)
+			{
+				if ((unsigned)def->playernum < MAXPLAYERS && idplayer(def->playernum).ingame())
+					gomo = idplayer(def->playernum).mo;
+
+				P_GetScriptGoing (gomo, NULL, def->script, scriptdata, 0, def->arg0, def->arg1, def->arg2, def->type == acsdefered_t::defexealways, true);
+
+			} else
+				PrintFmt(PRINT_HIGH,"P_DoDeferredScripts: Unknown script {}\n", def->script);
+			break;
+
+		case acsdefered_t::defsuspend:
+			SetScriptState (def->script, DLevelScript::SCRIPT_Suspended);
+			DPrintFmt("Defered suspend of script {}\n", def->script);
+			break;
+
+		case acsdefered_t::defterminate:
+			SetScriptState (def->script, DLevelScript::SCRIPT_PleaseRemove);
+			DPrintFmt("Defered terminate of script {}\n", def->script);
+			break;
+		}
+		delete def;
+		def = next;
+	}
+	level.info->defered = NULL;
+}
+
+static void addDefered (level_pwad_info_t& i, acsdefered_t::EType type, int script, int arg0, int arg1, int arg2, AActor *who)
+{
+	if (i.levelnum != 0)
+	{
+		acsdefered_t *def = new acsdefered_t;
+
+		def->next = i.defered;
+		def->type = type;
+		def->script = script;
+		def->arg0 = arg0;
+		def->arg1 = arg1;
+		def->arg2 = arg2;
+		if (who != NULL && who->player != NULL)
+		{
+			def->playernum = who->player->id;
+		}
+		else
+		{
+			def->playernum = -1;
+		}
+		i.defered = def;
+		DPrintFmt("Script {} on map {} defered\n", script, i.mapname);
+	}
+}
+
+bool P_StartScript (AActor *who, line_t *where, int script, const char *map, int lineSide,
+					int arg0, int arg1, int arg2, int always)
+{
+	if (level.mapname == map)
+	{
+		int *scriptdata;
+
+		if (level.behavior != NULL &&
+			(scriptdata = level.behavior->FindScript (script)) != NULL)
+		{
+			return P_GetScriptGoing (who, where, script,
+									 scriptdata,
+									 lineSide, arg0, arg1, arg2, always, false);
+		}
+		else
+		{
+			PrintFmt(PRINT_HIGH,"P_StartScript: Unknown script {}\n", script);
+		}
+	}
+	else
+	{
+		LevelInfos& levels = getLevelInfos();
+		addDefered (levels.findByName(map),
+					always ? acsdefered_t::defexealways : acsdefered_t::defexecute,
+					script, arg0, arg1, arg2, who);
+	}
+	return false;
+}
+
+void P_SuspendScript (int script, const char *map)
+{
+	if (level.mapname != map)
+	{
+		LevelInfos& levels = getLevelInfos();
+		addDefered(levels.findByName(map),
+			acsdefered_t::defsuspend, script, 0, 0, 0, NULL);
+	}
+	else
+	{
+		SetScriptState(script, DLevelScript::SCRIPT_Suspended);
+	}
+}
+
+void P_TerminateScript (int script, const char *map)
+{
+	if (level.mapname != map)
+	{
+		LevelInfos& levels = getLevelInfos();
+		addDefered(levels.findByName(map),
+			acsdefered_t::defterminate, script, 0, 0, 0, NULL);
+	}
+	else
+	{
+		SetScriptState (script, DLevelScript::SCRIPT_PleaseRemove);
+	}
+}
+
+void strbin (char *str)
+{
+	char *p = str, c;
+	int i;
+
+	while ( (c = *p++) ) {
+		if (c != '\\') {
+			*str++ = c;
+		} else if (*p) {
+			switch (*p) {
+				case 'c':
+					*str++ = '\034';	// TEXTCOLOR_ESCAPE
+					break;
+				case 'n':
+					*str++ = '\n';
+					break;
+				case 't':
+					*str++ = '\t';
+					break;
+				case 'r':
+					*str++ = '\r';
+					break;
+				case '\n':
+					break;
+				case 'x':
+				case 'X':
+					c = 0;
+					p++;
+					for (i = 0; i < 2; i++) {
+						c <<= 4;
+						if (*p >= '0' && *p <= '9')
+							c += *p-'0';
+						else if (*p >= 'a' && *p <= 'f')
+							c += 10 + *p-'a';
+						else if (*p >= 'A' && *p <= 'F')
+							c += 10 + *p-'A';
+						else
+							break;
+						p++;
+					}
+					*str++ = c;
+					break;
+				case '0':
+				case '1':
+				case '2':
+				case '3':
+				case '4':
+				case '5':
+				case '6':
+				case '7':
+					c = 0;
+					for (i = 0; i < 3; i++) {
+						c <<= 3;
+						if (*p >= '0' && *p <= '7')
+							c += *p-'0';
+						else
+							break;
+						p++;
+					}
+					*str++ = c;
+					break;
+				default:
+					*str++ = *p;
+					break;
+			}
+			p++;
+		}
+		else
+		{
+			// Trailing backlash
+		}
+	}
+	*str = 0;
+}
+
+FArchive &operator<< (FArchive &arc, acsdefered_t *defer)
+{
+	while (defer)
+	{
+		arc << (byte)1;
+		arc << (byte)defer->type << defer->script
+			<< defer->arg0 << defer->arg1 << defer->arg2;
+		defer = defer->next;
+	}
+	arc << (byte)0;
+	return arc;
+}
+
+FArchive &operator>> (FArchive &arc, acsdefered_t* &defertop)
+{
+	acsdefered_t **defer = &defertop;
+	byte inbyte;
+
+	arc >> inbyte;
+	while (inbyte)
+	{
+		*defer = new acsdefered_t;
+		arc >> inbyte;
+		(*defer)->type = (acsdefered_t::EType)inbyte;
+		arc >> (*defer)->script
+			>> (*defer)->arg0 >> (*defer)->arg1 >> (*defer)->arg2;
+		defer = &((*defer)->next);
+		arc >> inbyte;
+	}
+	*defer = NULL;
+	return arc;
+}
+
+
+BEGIN_COMMAND (scriptstat)
+{
+	if (DACSThinker::ActiveThinker == NULL)
+	{
+		PrintFmt(PRINT_HIGH,"No scripts are running.\n");
+	}
+	else
+	{
+		DACSThinker::ActiveThinker->DumpScriptStatus ();
+	}
+}
+END_COMMAND (scriptstat)
+
+void DACSThinker::DumpScriptStatus ()
+{
+	static const char *stateNames[] =
+	{
+		"Running",
+		"Suspended",
+		"Delayed",
+		"TagWait",
+		"PolyWait",
+		"ScriptWaitPre",
+		"ScriptWait",
+		"PleaseRemove"
+	};
+	DLevelScript *script = Scripts;
+
+	while (script != NULL)
+	{
+		PrintFmt(PRINT_HIGH,"{}: {}\n", script->script, stateNames[script->state]);
+		script = script->next;
+	}
+}
+
+
+VERSION_CONTROL (p_acs_cpp, "$Id: fb40577391819ee1b44c13023c84c33857d2ccfc $")

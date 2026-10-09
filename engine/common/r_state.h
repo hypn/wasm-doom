@@ -1,0 +1,177 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: fc5c6becd753a2e75e776f7d56e46340b17136c4 $
+//
+// Copyright (C) 1993-1996 by id Software, Inc.
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Refresh/render internal state variables (global).
+//
+//-----------------------------------------------------------------------------
+
+
+#pragma once
+
+// Need data structure definitions.
+#include "d_player.h"
+#include "r_data.h"
+
+#define WALLFRACBITS	4
+#define WALLFRACUNIT	(1<<WALLFRACBITS)
+
+
+//
+// Refresh internal data structures,
+//	for rendering.
+//
+
+// needed for texture pegging
+extern fixed_t* 		textureheight;
+
+extern "C" int			viewwidth;
+extern "C" int			viewheight;
+
+extern int				firstflat;
+extern int				numflats;
+
+// for global animation
+extern bool*			flatwarp;
+extern byte**			warpedflats;
+extern int*				flatwarpedwhen;
+extern int*				flattranslation;
+
+inline std::unique_ptr<int[]> texturetranslation;
+
+// Sprite....
+extern int				firstspritelump;
+extern int				lastspritelump;
+extern int				numspritelumps;
+
+//
+// Lookup tables for map data.
+//
+extern bool				g_ValidLevel;
+
+extern int				numsprites;
+extern OHashTable<int32_t, spritedef_t> sprites;
+
+extern int				numvertexes;
+extern vertex_t*		vertexes;
+
+extern int				numsegs;
+extern seg_t*			segs;
+
+extern int				numsectors;
+extern sector_t*		sectors;
+
+extern int				numsubsectors;
+extern subsector_t* 	subsectors;
+
+extern int				numnodes;
+extern node_t*			nodes;
+
+extern int				numlines;
+extern line_t*			lines;
+
+extern int				numsides;
+extern side_t*			sides;
+
+inline nonstd::span<vertex_t>    R_GetVertices() { return nonstd::span(vertexes, numvertexes); }
+
+inline nonstd::span<seg_t>       R_GetSegs() { return nonstd::span(segs, numsegs); }
+
+inline nonstd::span<sector_t>    R_GetSectors() { return nonstd::span(sectors, numsectors); }
+
+inline nonstd::span<subsector_t> R_GetSubsectors() { return nonstd::span(subsectors, numsubsectors); }
+
+inline nonstd::span<node_t>      R_GetNodes() { return nonstd::span(nodes, numnodes); }
+
+inline nonstd::span<line_t>      R_GetLines() { return nonstd::span(lines, numlines); }
+
+inline nonstd::span<side_t>      R_GetSides() { return nonstd::span(sides, numsides); }
+
+extern std::vector<int> originalLightLevels;
+
+inline FArchive &operator<< (FArchive &arc, sector_t *sec)
+{
+	if (sec)
+		return arc << (uint16_t)(sec - sectors);
+	else
+		return arc << (uint16_t)0xffff;
+}
+inline FArchive &operator>> (FArchive &arc, sector_t *&sec)
+{
+	uint16_t ofs;
+	arc >> ofs;
+	if (ofs == 0xffff)
+		sec = NULL;
+	else
+		sec = sectors + ofs;
+	return arc;
+}
+
+inline FArchive &operator<< (FArchive &arc, line_t *line)
+{
+	if (line)
+		return arc << (uint16_t)(line - lines);
+	else
+		return arc << (uint16_t)0xffff;
+}
+inline FArchive &operator>> (FArchive &arc, line_t *&line)
+{
+	uint16_t ofs;
+	arc >> ofs;
+	if (ofs == 0xffff)
+		line = NULL;
+	else
+		line = lines + ofs;
+	return arc;
+}
+
+struct LocalView
+{
+	angle_t angle;
+	bool setangle;
+	bool skipangle;
+	int pitch;
+	bool setpitch;
+	bool skippitch;
+};
+
+//
+// POV data.
+//
+inline fixed_t			viewx;
+inline fixed_t			viewy;
+inline fixed_t			viewz;
+
+inline angle_t			viewangle;
+inline sector_t*		viewsector;
+
+inline LocalView		localview;
+inline AActor*			camera;		// [RH] camera to draw from. doesn't have to be a player
+
+extern angle_t			clipangle;
+
+//extern fixed_t		finetangent[FINEANGLES/2];
+
+extern visplane_t*		floorplane;
+extern visplane_t*		ceilingplane;
+extern visplane_t*		skyplane;
+
+// [AM] 4:3 Field of View
+extern int				FieldOfView;
+// [AM] Corrected (for widescreen) Field of View
+extern int				CorrectFieldOfView;

@@ -1,0 +1,9 @@
+{
+  "name": "odamex-web-bridge",
+  "private": true,
+  "description": "Serves Odamex Web and relays browser clients to odasrv",
+  "main": "bridge.js",
+  "dependencies": {
+    "ws": "8.18.3"
+  }
+}

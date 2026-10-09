@@ -1,0 +1,102 @@
+// Emacs style mode select   -*- C++ -*-
+//-----------------------------------------------------------------------------
+//
+// $Id: 7a731f4132800a4e02c30192302129d4474a2a54 $
+//
+// Copyright (C) 2006-2026 by The Odamex Team.
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// DESCRIPTION:
+//	Voting-specific stuff.
+//
+//-----------------------------------------------------------------------------
+
+#pragma once
+
+/**
+ * An enum used for keeping track of the state of the vote as well as
+ * internally keeping track of individual player votes.
+ */
+enum vote_result_t
+{
+	VOTE_UNDEC,
+	VOTE_NO,
+	VOTE_YES,
+	VOTE_INTERRUPT,
+	VOTE_ABANDON
+};
+
+#define NUMVOTERESULTS (VOTE_ABANDON + 1)
+
+/**
+ * An enum used for sending the vote type over the wire.
+ */
+enum vote_type_t
+{
+	VOTE_NONE, // Reserved
+	VOTE_KICK,
+	VOTE_FORCESPEC,
+	VOTE_FORCESTART,
+	VOTE_RANDCAPS,
+	VOTE_RANDPICKUP,
+	VOTE_MAP,
+	VOTE_NEXTMAP,
+	VOTE_RANDMAP,
+	VOTE_RESTART,
+	VOTE_FRAGLIMIT,
+	VOTE_SCORELIMIT,
+	VOTE_TIMELIMIT,
+	VOTE_COINFLIP,
+	VOTE_LIVES,
+	VOTE_MAX // Reserved
+};
+
+inline auto format_as(vote_type_t eVoteType)
+{
+	return fmt::underlying(eVoteType);
+}
+
+// A struct to pass around voting state
+struct vote_state_t
+{
+	vote_result_t result;
+	std::string votestring;
+	short countdown;
+	byte yes;
+	byte yes_needed;
+	byte no;
+	byte no_needed;
+	byte abs;
+};
+
+/**
+ * A string array used to associate vote types with command names.
+ */
+inline const char* vote_type_cmd[] = {
+	"???",
+	"kick",
+	"forcespec",
+	"forcestart",
+	"randcaps",
+	"randpickup",
+	"map",
+	"nextmap",
+	"randmap",
+	"restart",
+	"fraglimit",
+	"scorelimit",
+	"timelimit",
+	"coinflip",
+	"lives",
+	"???"
+};
+
