@@ -127,7 +127,7 @@ upstream clean; compilers don't care. `.gitattributes` forces LF only for
 - The server binary needs the build machine's glibc/libstdc++ or newer
   (built on Ubuntu 24.04+: glibc 2.38, GLIBCXX 3.4.32).
 - Docker doesn't use `run.sh`: `Dockerfile` builds two images, run by
-  `compose.yaml`. `server` is `gcr.io/distroless/cc-debian13` (just glibc,
+  `docker-compose.yaml`. `server` is `gcr.io/distroless/cc-debian13` (just glibc,
   libstdc++ and zlib: no shell) and `bridge` is
   `gcr.io/distroless/nodejs22-debian13`; both run as `nonroot` (uid 65532)
   from the start, read-only, with no capabilities. The server is only on an

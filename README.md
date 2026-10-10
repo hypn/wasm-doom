@@ -209,7 +209,7 @@ docker compose up -d --build
 ```
 
 Then open http://localhost:8765/. It keeps running across reboots until
-stopped. To use another port, change `"8765:8765"` in `compose.yaml` to,
+stopped. To use another port, change `"8765:8765"` in `docker-compose.yaml` to,
 for example, `"8080:8765"`.
 
 | Command | What |
@@ -225,8 +225,8 @@ easiest way onto a VPS with an older OS. The first build downloads the
 Emscripten SDK and compiles everything, so it takes a while; later builds
 reuse the compiled files and are much quicker.
 
-It then makes two small images, run as two containers by `compose.yaml`: the
-game server, and the bridge (which also serves the site). Both are set up so
+It then makes two small images, run as two containers by
+`docker-compose.yaml`: the game server, and the bridge (which also serves the site). Both are set up so
 that even if someone found a way to run code through one of them, they could
 do little with it:
 
@@ -295,7 +295,7 @@ to allow them, for every player.
 | Path | What |
 |---|---|
 | `build.sh` | Builds everything into `dist/` |
-| `Dockerfile`, `compose.yaml`, `.dockerignore` | Builds and runs everything with Docker |
+| `Dockerfile`, `docker-compose.yaml`, `.dockerignore` | Builds and runs everything with Docker |
 | `AGENTS.md` | Technical notes for AI coding agents: design decisions and gotchas |
 | `.gitattributes` | Keeps shell scripts LF and WADs untouched in any git checkout |
 | `engine/` | The Odamex engine: source (`client/`, `common/`, `server/`, `odaproto/`), bundled libraries (`libraries/`: fmt, JsonCpp, libADLMIDI, minilzo, protobuf, textscreen, tinylibs), CMake modules and `wad/resources.wad`, the engine's built-in resources |
