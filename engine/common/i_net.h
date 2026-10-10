@@ -172,6 +172,7 @@ enum clientBuf_e
 #define SVC_PM_CHEATS BIT(5)
 
 extern int   localport;
+extern const char* localaddress;
 extern int   msg_badread;
 
 // network message info

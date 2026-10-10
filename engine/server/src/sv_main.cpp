@@ -479,6 +479,12 @@ void SV_InitNetwork (void)
 	else
 	   localport = SERVERPORT;
 
+	// Odamex Web: "-ip 127.0.0.1" lets only programs on this machine, such
+	// as the bridge, reach the server.
+	localaddress = Args.CheckValue("-ip");
+	if (localaddress)
+		PrintFmt(PRINT_HIGH, "listening on {} only\n", localaddress);
+
 	// set up a socket and net_message buffer
 	InitNetCommon();
 

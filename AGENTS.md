@@ -40,6 +40,8 @@ Changed upstream files (diff against tag `12.3.0` for details):
   `server/src/sv_maplist.cpp`
 - Console background (`TITLEPIC`): `client/src/c_console.cpp`
 - `logfile` no longer creates `~/.odamex` when given a path: `common/c_dispatch.cpp`
+- `odasrv -ip <address>` binds to one address: `common/i_net.{h,cpp}`,
+  `server/src/sv_main.cpp`
 - All the CMake files, and `engine/wad/` (replaced entirely)
 
 Preserve line endings when editing, and don't mass-convert them:
@@ -121,10 +123,37 @@ upstream clean; compilers don't care. `.gitattributes` forces LF only for
 - Don't move settings into `-config`: that file is executed *before* the WADs
   load, so `addmap` fails there. `server.cfg` is `+exec`'d afterwards.
 - `odasrv` refuses to run as root (`server/src/i_main.cpp`); `run.sh` checks
-  for root first, and the Docker image runs as user `doom`.
+  for root first.
 - The server binary needs the build machine's glibc/libstdc++ or newer
-  (built on Ubuntu 24.04+: glibc 2.38, GLIBCXX 3.4.32). Docker sidesteps this
-  by using `ubuntu:24.04` for both stages; keep the two stages on the same base.
+  (built on Ubuntu 24.04+: glibc 2.38, GLIBCXX 3.4.32).
+- Docker doesn't use `run.sh`: `Dockerfile` builds two images, run by
+  `compose.yaml`. `server` is `gcr.io/distroless/cc-debian13` (just glibc,
+  libstdc++ and zlib: no shell) and `bridge` is
+  `gcr.io/distroless/nodejs22-debian13`; both run as `nonroot` (uid 65532)
+  from the start, read-only, with no capabilities. The server is only on an
+  `internal` network, so it has no internet access, and listens on all of
+  that container's addresses (no `-ip`); the bridge reaches it as
+  `server:10666`. The build stage is `debian:13` to match the runtime
+  glibc; keep them on the same Debian release. `odasrv`'s arguments in the
+  `Dockerfile` mirror `run.sh`'s; keep them in step. Without `+logfile`
+  and `-crashdir`, it tries to create `~/.odamex` and fails on the
+  read-only filesystem.
+
+- `run.sh` starts `odasrv` with `-ip 127.0.0.1` (added here:
+  `common/i_net.{h,cpp}`, `server/src/sv_main.cpp`), so the server can't be
+  reached except through the bridge. Upstream binds to all interfaces.
+- Every player reaches `odasrv` from `127.0.0.1` (a different port each), so
+  the server's IP bans and any per-IP logic see one address. Per-IP limits
+  belong in the bridge.
+- `bridge.js` faces the internet: it must never throw on bad input (one
+  uncaught exception stops the whole game). `maxPayload` caps a WebSocket
+  message, i.e. one datagram; keep it above Odamex's 8 KB `MAX_UDP_PACKET`.
+  Its UDP sockets are `connect()`ed to `odasrv`, so nothing else can inject
+  packets. The packet rate limit (100/s, bursts of 200) must stay well above
+  the client's 35/s.
+- RCON (remote admin) is off because `rcon_password` is unset. If one is
+  set, anyone who can load the page can try passwords through the bridge, so
+  it must be strong.
 
 ## Build system
 

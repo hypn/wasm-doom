@@ -1,0 +1,43 @@
+# Odamex Web: the game server and the bridge, as two locked-down containers.
+#
+#   docker compose up -d --build     build, then start (and keep running)
+#   docker compose logs -f           follow both logs
+#   docker compose down              stop and remove
+#
+# To use another port, change the "8765:8765" below to "8080:8765".
+
+# Settings both containers share: nothing writable but a small /tmp, no
+# capabilities, no way to gain privileges, limited processes and memory,
+# and an init process to pass "docker stop" on.
+x-hardened: &hardened
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 64
+  mem_limit: 256m
+  init: true
+  restart: unless-stopped
+
+services:
+  server:
+    <<: *hardened
+    build: { context: ., target: server }
+    image: odamex-web-server
+    # Only the internal network: the game server can't reach the internet,
+    # and nothing but the bridge can reach it.
+    networks: [game]
+
+  bridge:
+    <<: *hardened
+    build: { context: ., target: bridge }
+    image: odamex-web-bridge
+    ports: ["8765:8765"]
+    networks: [game, public]
+    depends_on: [server]
+
+networks:
+  game:
+    internal: true
+  public: {}

@@ -101,7 +101,7 @@ The first run installs the bridge's one dependency (`ws`) into
 server for `dist/www/`.
 
 The bridge serves the site and the WebSocket on the HTTP port; the server
-listens on UDP 10666, which only the bridge needs to reach. The game
+listens on UDP 10666 on `127.0.0.1` only, so only the bridge can reach it. The game
 therefore needs only HTTP and one WebSocket, and a single reverse proxy can
 expose it (see HTTPS under [Deploying to a VPS](#deploying-to-a-vps)).
 
@@ -148,8 +148,8 @@ sudo -u doom /home/doom/odamex-web/run.sh
 ```
 
 Open `http://your-vps-ip:8765/`; Ctrl+C stops it. Only TCP 8765 needs to be
-open: the game server's UDP port (10666) is only used by the bridge, on the
-same machine.
+open: the game server listens only on `127.0.0.1`, for the bridge on the same
+machine, so it can't be reached from outside even with no firewall.
 
 **4. Keep it running,** across logouts and reboots, as a systemd service.
 Create `/etc/systemd/system/odamex-web.service` (e.g. with
@@ -202,33 +202,55 @@ The multiplayer page switches to a secure WebSocket by itself.
 ## Docker
 
 Instead of setting up a build machine, Docker can build and run everything.
-Only Docker is needed:
+Only Docker (with Compose, included in current Docker) is needed:
 
 ```sh
-docker build -t odamex-web .
-docker run -d --name odamex-web -p 8765:8765 -v odamex-logs:/app/logs \
-  --restart unless-stopped odamex-web
+docker compose up -d --build
 ```
 
-Then open http://localhost:8765/. `--restart unless-stopped` keeps it running
-across reboots, and the `odamex-logs` volume keeps the logs across
-containers.
+Then open http://localhost:8765/. It keeps running across reboots until
+stopped. To use another port, change `"8765:8765"` in `compose.yaml` to,
+for example, `"8080:8765"`.
 
 | Command | What |
 |---|---|
-| `docker logs -f odamex-web` | Follow the server's and bridge's output |
-| `docker stop odamex-web` / `docker start odamex-web` | Stop and start it |
-| `docker build -t odamex-web .` then `docker rm -f odamex-web` and the `docker run` above | Update it after changing anything, including `multiplayer/server.cfg` |
+| `docker compose logs -f` | Follow the server's and bridge's output |
+| `docker compose stop` / `docker compose start` | Stop and start it |
+| `docker compose up -d --build` | Update it after changing anything, including `multiplayer/server.cfg` |
+| `docker compose down` | Stop and remove it |
 
-The image is built in two stages: one with the build tools runs `build.sh`,
-and the final image holds only `dist/` and Node.js, running as a normal user.
-Both use Ubuntu 24.04, so the host's OS version doesn't matter; this also
-makes Docker the easiest way onto a VPS with an older OS. The first build
-downloads the Emscripten SDK and compiles everything, so it takes a while;
-later builds reuse the compiled files and are much quicker.
+The `Dockerfile` builds everything in a Debian 13 container with the build
+tools, so the host's OS version doesn't matter; this also makes Docker the
+easiest way onto a VPS with an older OS. The first build downloads the
+Emscripten SDK and compiles everything, so it takes a while; later builds
+reuse the compiled files and are much quicker.
 
-The ban list lives inside the container, so a new container starts with an
-empty one.
+It then makes two small images, run as two containers by `compose.yaml`: the
+game server, and the bridge (which also serves the site). Both are set up so
+that even if someone found a way to run code through one of them, they could
+do little with it:
+
+- **No shell or tools:** both are "distroless" images, holding only what the
+  program needs: the game server has the C and C++ libraries, the bridge
+  Node.js. There is no shell, package manager or other program to use.
+- **No privileges:** both run as a normal user from the start, with no
+  capabilities and no way to gain any, and nothing in either container is
+  writable except a small `/tmp`. The site that players download can't be
+  changed.
+- **Separated:** each runs in its own container, so neither can interfere
+  with the other.
+- **No internet for the game server:** it is only on an internal network
+  shared with the bridge, so it can't connect anywhere else, and nothing
+  but the bridge can reach it.
+- **Limited resources:** each container is capped in memory and processes.
+
+The bridge can still make outgoing connections (it needs a network to serve
+players); a firewall on the host or at the VPS provider can block those.
+
+The logs are Docker's (`docker compose logs`), not files. The server says
+"Could not create new banlist" when it starts, because it can't write files;
+the ban list isn't needed, since there is no remote administration to ban
+players with.
 
 ## Server settings
 
@@ -237,6 +259,17 @@ The server takes all its settings from `server.cfg` (source:
 frags or 10 minutes per map then the next map, up to 16 players. To change
 them, edit `multiplayer/server.cfg`, run `./build.sh server` (or edit
 `dist/server/server.cfg` directly) and restart `dist/run.sh`.
+
+`server.cfg` also turns off everything players could use to change the game
+for others: cheats, every kind of vote, and remote administration (RCON, which
+stays off while `rcon_password` is empty). To change the game, edit the file
+and restart the server.
+
+The bridge limits what any one visitor can do: at most 64 connections in all
+and 16 per IP address, at most 100 packets a second per connection (a player
+sends about 35), and a connection that stops answering is dropped. Behind a
+reverse proxy on the same machine (such as Caddy), it takes the player's
+address from the proxy's `X-Forwarded-For` header.
 
 Everything the server and bridge write stays in `dist/`; nothing goes to
 `~/.odamex`, Odamex's usual folder:
@@ -262,7 +295,7 @@ to allow them, for every player.
 | Path | What |
 |---|---|
 | `build.sh` | Builds everything into `dist/` |
-| `Dockerfile`, `.dockerignore` | Builds and runs everything with Docker |
+| `Dockerfile`, `compose.yaml`, `.dockerignore` | Builds and runs everything with Docker |
 | `AGENTS.md` | Technical notes for AI coding agents: design decisions and gotchas |
 | `.gitattributes` | Keeps shell scripts LF and WADs untouched in any git checkout |
 | `engine/` | The Odamex engine: source (`client/`, `common/`, `server/`, `odaproto/`), bundled libraries (`libraries/`: fmt, JsonCpp, libADLMIDI, minilzo, protobuf, textscreen, tinylibs), CMake modules and `wad/resources.wad`, the engine's built-in resources |
@@ -284,6 +317,8 @@ to allow them, for every player.
   the scoreboard, M the automap, and the scoreboard is drawn at 2×.
 - No WAD downloads (curl), boot window (FLTK), stack traces (cpptrace) or UPnP.
 - The `logfile` command no longer creates `~/.odamex` when given a path.
+- The server takes `-ip <address>` to listen on one address only; `run.sh`
+  uses `127.0.0.1`.
 - The version string has no git commit (it described Odamex's own repository).
 - Desktop builds, the launchers, installers and tests are removed; the
   client builds for the browser only.

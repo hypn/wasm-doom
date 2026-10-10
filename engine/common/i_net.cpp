@@ -84,6 +84,7 @@ typedef int SOCKET;
 
 unsigned int	inet_socket;
 int         	localport;
+const char*		localaddress;	// bind to this IPv4 address only (NULL: all)
 netadr_t    	net_from;   // address of who sent the packet
 
 buf_t       net_message(MAX_UDP_PACKET);
@@ -287,6 +288,8 @@ void BindToLocalPort (SOCKET s, u_short wanted)
 	memset (&address, 0, sizeof(address));
 	address.sin_family = AF_INET;
 	address.sin_addr.s_addr = INADDR_ANY;
+	if (localaddress && inet_pton(AF_INET, localaddress, &address.sin_addr) != 1)
+		I_FatalError("BindToPort: invalid address {}", localaddress);
 	u_short next = wanted;
 
 	// denis - try several ports

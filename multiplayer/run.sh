@@ -67,10 +67,12 @@ mkdir -p "$DIST/logs"
 # odasrv writes files such as banlist.json to its working directory, and would
 # otherwise use ~/.odamex for its log, crash reports and saved settings.  All
 # its settings are in server.cfg, run once the WADs are loaded (addmap needs
-# them), so the saved-settings file is left empty.
+# them), so the saved-settings file is left empty.  -ip 127.0.0.1 keeps the
+# server off the network: only the bridge, on this machine, can reach it.
 (cd "$DIST/server" && exec ./odasrv -config /dev/null \
   -crashdir "$DIST/logs" +logfile "$DIST/logs/odasrv.log" \
-  -iwad "$DIST/www/wads/DOOM1.WAD" -port "$SERVER_PORT" +exec server.cfg </dev/null) &
+  -iwad "$DIST/www/wads/DOOM1.WAD" -ip 127.0.0.1 -port "$SERVER_PORT" \
+  +exec server.cfg </dev/null) &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
