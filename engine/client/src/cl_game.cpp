@@ -1022,6 +1022,14 @@ void G_Ticker (void)
 
 			if (gameaction == ga_fullconsole) // Host_EndGame was called
 				return;
+
+#ifdef __EMSCRIPTEN__
+			// The packets that arrived while the tab was hidden are all read
+			// here at once, and acking each one could overflow net_buffer,
+			// which would then send garbage.  Send the acks in batches.
+			if (net_buffer.size() > MAX_UDP_PACKET / 2)
+				NET_SendPacket(net_buffer, serveraddr);
+#endif
 		}
 
 		if (!(gametic%TICRATE))

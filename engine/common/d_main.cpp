@@ -1191,6 +1191,15 @@ public:
 		mAccumulator += mFrameStartTime - mPreviousFrameStartTime;
 		mPreviousFrameStartTime = mFrameStartTime;
 
+#ifdef __EMSCRIPTEN__
+		// The browser stops running frames while the tab is hidden.  Drop
+		// whatever time this call can't catch up on instead of carrying it
+		// over: running the backlog at mMaxCount tics per frame would play the
+		// game fast-forward, and every extra tic sends a ticcmd that the
+		// server queues up and plays back late, which is lag and rubberbanding.
+		mAccumulator = std::min<dtime_t>(mAccumulator, mFrameDuration * mMaxCount);
+#endif
+
 		int count = mMaxCount;
 
 		while (mAccumulator >= mFrameDuration && count--)

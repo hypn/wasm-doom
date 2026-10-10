@@ -101,9 +101,9 @@ The first run installs the bridge's one dependency (`ws`) into
 server for `dist/www/`.
 
 The bridge serves the site and the WebSocket on the HTTP port; the server
-listens on UDP 10666, which only the bridge needs to reach. So the game uses
-only HTTP and one WebSocket, and a single tunnel exposes it to friends, for
-example `cloudflared tunnel --url http://localhost:8765` (no account needed).
+listens on UDP 10666, which only the bridge needs to reach. The game
+therefore needs only HTTP and one WebSocket, and a single reverse proxy can
+expose it (see HTTPS under [Deploying to a VPS](#deploying-to-a-vps)).
 
 Controls: click the game to capture the mouse, Esc for the menu, the `` ` ``
 key for the console, T to chat, hold Tab for the scoreboard, M for the
@@ -274,7 +274,8 @@ to allow them, for every player.
 
 - The client runs its game loop as browser animation frames
   (`emscripten_set_main_loop`), and the client no longer reads console
-  commands from a terminal.
+  commands from a terminal. After the tab has been hidden, the game resumes
+  where it was instead of fast-forwarding through the time it missed.
 - No `odamex.wad`: the engine resources Doom 1 needs are compiled into the
   executables from `engine/wad/resources.wad` (see below).
 - The full-screen console shows the game's title screen instead of the

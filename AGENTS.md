@@ -27,6 +27,9 @@ Every client-only web change is behind `#ifdef __EMSCRIPTEN__`; grep for it.
 Changed upstream files (diff against tag `12.3.0` for details):
 
 - Game loop: `client/src/d_main.cpp`, `client/sdl/i_main.cpp`, `common/d_main.cpp`
+- Hidden-tab recovery: `common/d_main.cpp` (`CappedTaskScheduler`),
+  `client/src/cl_game.cpp` (ack batching), `client/src/cl_main.cpp`
+  (`CL_SimulateSectors`)
 - Stubs for removed dependencies: `client/src/cl_download.cpp`,
   `client/src/otransfer.{h,cpp}` (curl), `common/m_stacktrace.cpp` (cpptrace),
   `common/m_consolecommandstream.cpp` (threads), `common/m_fileio_posix.cpp`
@@ -59,6 +62,19 @@ upstream clean; compilers don't care. `.gitattributes` forces LF only for
   `main()` has returned, `D_DoomLoopFrame` catches everything itself and
   reports to the page through `Module.onFatal`; unknown types are named via
   `abi::__cxa_current_exception_type()`.
+- **Hidden tabs.** The browser stops animation frames while the tab is
+  hidden, but the WebSocket keeps queueing the server's packets. On return,
+  `CappedTaskScheduler` drops the missed time instead of fast-forwarding
+  through it (each extra tic sends a ticcmd that the server queues: lag and
+  rubberbanding), and the client sends the backlog's acks in batches so
+  `net_buffer` (8 KB; once overflowed it sends garbage) doesn't overflow.
+  The backlog itself must still be read: the server resends only what isn't
+  acked, so dropping packets loses spawns and deaths. Doors and lifts only
+  move through sector snapshots (the server doesn't send their line
+  activations), applied at `world_index`, which jumps ahead after a backlog;
+  `CL_SimulateSectors` applies the latest snapshot before discarding stale
+  ones, or doors would stay where they were when the tab was hidden. After 65 s hidden, the
+  server times the player out (`CLIENT_TIMEOUT`).
 - **No threads.** The build has no pthreads; `std::thread` throws "Not
   supported" at runtime (that was the stdin console reader, now stubbed). Keep
   it that way rather than enabling pthreads, which needs cross-origin isolation

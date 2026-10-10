@@ -2285,8 +2285,10 @@ CVAR_FUNC_IMPL (cl_interp)
 //
 void CL_SimulateSectors()
 {
+#ifndef __EMSCRIPTEN__
 	// Get rid of snapshots for sectors that are done moving
 	CL_RemoveCompletedMovingSectors();
+#endif
 
 	// Move sectors
 	for (const auto& [sectornum, snapmanager] : sector_snaps)
@@ -2315,6 +2317,14 @@ void CL_SimulateSectors()
 			snap.toSector(sector);
 		}
 	}
+
+#ifdef __EMSCRIPTEN__
+	// Get rid of snapshots for sectors that are done moving, but only after
+	// applying them above: after the tab has been hidden, world_index jumps
+	// past all the snapshots received meanwhile, and removing them first would
+	// leave doors and lifts where they were when the tab was hidden.
+	CL_RemoveCompletedMovingSectors();
+#endif
 }
 
 //
