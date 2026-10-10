@@ -75,8 +75,13 @@ upstream clean; compilers don't care. `.gitattributes` forces LF only for
   move through sector snapshots (the server doesn't send their line
   activations), applied at `world_index`, which jumps ahead after a backlog;
   `CL_SimulateSectors` applies the latest snapshot before discarding stale
-  ones, or doors would stay where they were when the tab was hidden. After 65 s hidden, the
-  server times the player out (`CLIENT_TIMEOUT`).
+  ones, or doors would stay where they were when the tab was hidden. The
+  local player's power-up timers only count down as the client runs tics, so
+  after a backlog (more than `TICRATE` packets read at once) the client sends
+  `clc_getplayerinfo` and the server's `svc_playerinfo` corrects them; other
+  players' powers come with every `svc_moveplayer`, and `level.time` every
+  second. After 65 s hidden, the server times the player out
+  (`CLIENT_TIMEOUT`).
 - **No threads.** The build has no pthreads; `std::thread` throws "Not
   supported" at runtime (that was the stdin console reader, now stubbed). Keep
   it that way rather than enabling pthreads, which needs cross-origin isolation

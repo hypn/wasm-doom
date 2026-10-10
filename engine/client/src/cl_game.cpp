@@ -1002,6 +1002,9 @@ void G_Ticker (void)
 
 	if (connected && !simulated_connection)
 	{
+#ifdef __EMSCRIPTEN__
+		int packets_read = 0;
+#endif
 		while ((packet_size = NET_GetPacket()) )
 		{
 			// denis - don't accept candy from strangers
@@ -1029,8 +1032,21 @@ void G_Ticker (void)
 			// which would then send garbage.  Send the acks in batches.
 			if (net_buffer.size() > MAX_UDP_PACKET / 2)
 				NET_SendPacket(net_buffer, serveraddr);
+			packets_read++;
 #endif
 		}
+
+#ifdef __EMSCRIPTEN__
+		// More than a second's worth of packets at once: the tab was hidden.
+		// The local player's power-up timers (invisibility, invulnerability,
+		// radiation suit, light amplification, berserk's fade) only count
+		// down on the client as tics run, and the hidden time was dropped,
+		// so they'd run that much too long: the player would stay invisible
+		// after the server had ended it.  Ask the server for the player's
+		// current state, as CL_FireWeapon does after a misprediction.
+		if (packets_read > TICRATE)
+			MSG_WriteMarker(&net_buffer, clc_getplayerinfo);
+#endif
 
 		if (!(gametic%TICRATE))
 		{
