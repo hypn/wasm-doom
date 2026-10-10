@@ -4,3 +4,11 @@
 build
 dist
 **/node_modules
+
+# Docs and repo settings: changing them shouldn't rebuild the image.
+# Root level only: engine/libraries/fmt lists its own *.md as sources.
+*.md
+.gitignore
+.gitattributes
+.dockerignore
+Dockerfile
