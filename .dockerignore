@@ -12,4 +12,4 @@ dist
 .gitattributes
 .dockerignore
 Dockerfile
-compose.yaml
+docker-compose.yaml
