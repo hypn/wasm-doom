@@ -267,9 +267,18 @@ and restart the server.
 
 The bridge limits what any one visitor can do: at most 64 connections in all
 and 16 per IP address, at most 100 packets a second per connection (a player
-sends about 35), and a connection that stops answering is dropped. Behind a
-reverse proxy on the same machine (such as Caddy), it takes the player's
-address from the proxy's `X-Forwarded-For` header.
+sends about 35), and a connection that stops answering is dropped.
+
+Behind a reverse proxy on the same machine (Caddy, nginx), the bridge takes
+the player's address, for its limits and log, from the proxy's
+`X-Forwarded-For` header. It believes that header only from the addresses in
+the `TRUSTED_PROXIES` environment variable: a comma-separated list of
+addresses, subnets (`10.0.0.0/8`) and `gateway` (the default gateway, which
+is how a proxy on the host reaches a Docker container). It is `127.0.0.1,::1`
+by default, and `gateway` in `docker-compose.yaml`. For nginx, set the header
+with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, in the
+`/ws` location as well. The game server's own log still shows every player
+coming from the bridge.
 
 Everything the server and bridge write stays in `dist/`; nothing goes to
 `~/.odamex`, Odamex's usual folder:

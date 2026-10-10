@@ -11,6 +11,7 @@
 const dgram = require('node:dgram');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
 
@@ -101,18 +102,54 @@ const HEARTBEAT_MS = 30000;           // drop connections that stop answering pi
 const connectionsPerIp = new Map();
 let connections = 0;
 
-// The browser's address.  Behind a reverse proxy on this machine (Caddy,
-// cloudflared), connections come from loopback, and the proxy's
-// X-Forwarded-For is used instead: its last entry, the one the proxy added.
-// Anyone else's is ignored, since they could forge it.  (Docker's port
-// forwarding can make connections come from a private gateway address; that
-// isn't trusted, since the connection may still be from anywhere.)
+// Reverse proxies whose X-Forwarded-For is believed: a comma-separated list of
+// addresses, subnets (172.18.0.0/16) and "gateway", this machine's default
+// gateway (in Docker, how the host's proxy reaches a published port).  Only
+// list proxies: anyone else connecting from one of these addresses could make
+// up their own.
+const TRUSTED_PROXIES = process.env.TRUSTED_PROXIES || '127.0.0.1,::1';
+
+// "::ffff:1.2.3.4", how IPv4 addresses arrive on a dual-stack socket, as 1.2.3.4.
+function plainIp(ip) {
+  return ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+}
+
+// The default gateway from /proc/net/route, where it is hex, in byte order.
+function defaultGateway() {
+  try {
+    for (const line of fs.readFileSync('/proc/net/route', 'latin1').split('\n').slice(1)) {
+      const [, destination, gateway] = line.trim().split(/\s+/);
+      if (destination === '00000000' && gateway && gateway !== '00000000') {
+        return Buffer.from(gateway, 'hex').reverse().join('.');
+      }
+    }
+  } catch {}
+  return null;
+}
+
+const trustedProxies = new net.BlockList();
+for (const entry of TRUSTED_PROXIES.split(',').map((e) => e.trim()).filter(Boolean)) {
+  const [address, prefix] = entry === 'gateway' ? [defaultGateway()] : entry.split('/');
+  const type = address && net.isIP(address) === 6 ? 'ipv6' : 'ipv4';
+  if (!address || !net.isIP(address) || (prefix !== undefined && !/^\d+$/.test(prefix))) {
+    console.error(`[bridge] error: TRUSTED_PROXIES: can't use "${entry}"`);
+    process.exit(1);
+  }
+  if (prefix !== undefined) trustedProxies.addSubnet(address, Number(prefix), type);
+  else trustedProxies.addAddress(address, type);
+  console.log(`[bridge] trusting X-Forwarded-For from ${entry === 'gateway' ? address + ' (gateway)' : entry}`);
+}
+
+// The browser's address.  Behind a trusted reverse proxy, the proxy's
+// X-Forwarded-For is used instead: its last entry, the one the proxy added
+// (nginx's $proxy_add_x_forwarded_for, Caddy and cloudflared all add one).
 function clientIp(req) {
-  const ip = req.socket.remoteAddress || '';
-  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+  const ip = plainIp(req.socket.remoteAddress || '');
   const forwarded = req.headers['x-forwarded-for'];
-  if (isLoopback && typeof forwarded === 'string' && forwarded.trim()) {
-    return forwarded.split(',').pop().trim();
+  if (typeof forwarded === 'string' && net.isIP(ip) &&
+      trustedProxies.check(ip, net.isIP(ip) === 6 ? 'ipv6' : 'ipv4')) {
+    const last = plainIp(forwarded.split(',').pop().trim());
+    if (net.isIP(last)) return last;
   }
   return ip;
 }

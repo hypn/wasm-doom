@@ -34,6 +34,12 @@ services:
     build: { context: ., target: bridge }
     image: odamex-web-bridge
     ports: ["8765:8765"]
+    # A reverse proxy on the host (nginx, Caddy) reaches the bridge through
+    # the network's gateway, so the player's address is taken from the
+    # proxy's X-Forwarded-For when it comes from there.  Players connecting
+    # directly keep their own address, so they can't pretend.
+    environment:
+      TRUSTED_PROXIES: gateway
     networks: [game, public]
     depends_on: [server]
 

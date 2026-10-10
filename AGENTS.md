@@ -151,6 +151,12 @@ upstream clean; compilers don't care. `.gitattributes` forces LF only for
   Its UDP sockets are `connect()`ed to `odasrv`, so nothing else can inject
   packets. The packet rate limit (100/s, bursts of 200) must stay well above
   the client's 35/s.
+- The bridge believes `X-Forwarded-For` (last entry) only from
+  `TRUSTED_PROXIES` (default loopback; `gateway` in `docker-compose.yaml`,
+  read from `/proc/net/route`). Docker's port forwarding makes connections
+  from the host's proxy arrive from the network's gateway, while outside
+  players keep their own address, so trusting the gateway is safe there;
+  don't trust whole private ranges.
 - RCON (remote admin) is off because `rcon_password` is unset. If one is
   set, anyone who can load the page can try passwords through the bridge, so
   it must be strong.
