@@ -39,6 +39,18 @@ Changed upstream files (diff against tag `12.3.0` for details):
   `client/src/wi_interlevel.cpp`, `server/src/sv_level.cpp`,
   `server/src/sv_maplist.cpp`
 - Console background (`TITLEPIC`): `client/src/c_console.cpp`
+- Options menu items for non-classic movement are hidden:
+  `client/src/m_options.cpp`. These are the Jump binding, the controls
+  menu's "Advanced Movement" section (fly, look up/down, center view, mouse
+  and keyboard look), and "Always FreeLook" and "Lookspring" for the mouse
+  and joystick. Only the menu entries are removed. The commands, cvars,
+  default binds (mouse4 is `+jump`) and server settings (`sv_allowjump`,
+  `sv_freelook`) still work from the console or a config. The sensitivity
+  and invert settings for looking stay visible because spectators can
+  always look up and down, whatever `sv_freelook` says. The menu arrays are
+  sized with `ARRAY_LENGTH` and nothing indexes into them, so hiding entries
+  is safe. If you turn either server setting on, also undo the matching
+  `#ifndef` block.
 - `logfile` no longer creates `~/.odamex` when given a path: `common/c_dispatch.cpp`
 - `odasrv -ip <address>` binds to one address: `common/i_net.{h,cpp}`,
   `server/src/sv_main.cpp`
